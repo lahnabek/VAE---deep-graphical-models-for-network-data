@@ -15,7 +15,7 @@ import pandas as pd
 # Paramètres de base
 # -------------------------------
 DATA_FOLDER = "data_human_brain_networks/graphs_spanningtree_180"  # ou graphs_spanningtree_180
-OUTPUT_FOLDER = "dataset_spanningtree"
+OUTPUT_FOLDER = "dataset_numpy_spanningtree"
 N_REGIONS = 180
 
 # Créer le dossier de sortie s’il n’existe pas
@@ -56,7 +56,7 @@ for idx, filename in enumerate(files):
 print(f"\n Toutes les matrices A ont été sauvegardées dans {os.path.abspath(OUTPUT_FOLDER)}")
 
 # -------------------------------
-# 📊 Vérification d’un exemple
+#  Vérification d’un exemple
 # -------------------------------
 sample = np.load(os.path.join(OUTPUT_FOLDER, "A_subject_000.npy"))
 print(f"Exemple : matrice shape = {sample.shape}, densité = {sample.sum() / (N_REGIONS**2):.4f}")
