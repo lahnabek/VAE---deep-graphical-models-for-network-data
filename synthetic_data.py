@@ -176,4 +176,4 @@ if __name__ == "__main__":
     # Exemple "proche article" : 180 régions, ~8 réseaux, clusters quasi équilibrés,
     # forte densité intra (p_in) et faible inter (p_out) ⇒ communautés bien séparées.
     save_batch(outdir="data_numpy_synthetic", n_graphs=10,
-               N=50, K=3, p_in=0.28, p_out=0.015, seed=0)
+               N=50, K=3, p_in=0.99, p_out=0.01, seed=0)
