@@ -15,6 +15,13 @@ from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import confusion_matrix, adjusted_rand_score, normalized_mutual_info_score
 from torch_geometric.utils import dense_to_sparse
 
+import networkx as nx
+import matplotlib.pyplot as plt
+from matplotlib.patches import Wedge, Patch
+import matplotlib.colors as mcolors
+
+
+
 
 from class_GCN import *
 from class_GCNEncoder import *
@@ -22,7 +29,7 @@ from class_GCNEncoder import *
 # CONFIG
 # ---------------------------------------------------------------------
 
-DATA_DIR = "data_numpy_synthetic"  
+DATA_DIR =  "miscdata" #"data_numpy_synthetic" 
 RANDOM_STATE = 42
 HIDDEN_LAYERS_GCN = 32
 MAX_EPOCHS_INIT = 300     # Phase init encodeur (Algorithme 1)
@@ -335,6 +342,160 @@ def save_all_figures(results_dir, best, Q):
     plot_Pi_matrix(best["Pi"], Q, results_dir)
     plot_eta_histogram(best["eta"], Q, results_dir)
 
+
+# -----------------------------------------------------------
+# REPRESENTATION
+# -----------------------------------------------------------
+
+
+def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, node_radius=None, results_dir=None):
+    """
+    A : (n,n) 
+    eta : (n,k) 
+    class_colors : coleurs, facultatives
+    node_radius : taille des nodes
+    """
+    n, k = eta.shape
+
+    if not node_radius:
+        node_radius = 1.5/n
+
+
+    if not class_colors:
+        cmap = plt.get_cmap("tab10")
+        class_colors = [cmap(i % cmap.N) for i in range(k)]
+
+    
+    if class_labels is None:
+        class_labels = [f"Class {i}" for i in range(k)]
+
+
+    print('col', class_colors, 'lab', class_labels)
+
+    G = nx.from_numpy_array(A)
+    pos = nx.spring_layout(G, seed=0)
+
+    fig, ax = plt.subplots(figsize=(8,8))
+    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.4)
+    
+    for i, (x, y) in pos.items():
+        start_angle = 90
+        for frac, color in zip(eta[i], class_colors):
+            if frac <= 0:  # skip empty slices
+                continue
+            theta1 = start_angle
+            theta2 = start_angle + 360 * frac
+            wedge = Wedge(center=(x, y),
+                          r=node_radius,
+                          theta1=theta1,
+                          theta2=theta2,
+                          facecolor=color,
+                          edgecolor='black',
+                          linewidth=0.3
+                          )
+            ax.add_patch(wedge)
+            start_angle = theta2
+    
+    for (x, y) in pos.values():
+        circ = plt.Circle((x, y), node_radius, fill=False, edgecolor='black', lw=0.3)
+        ax.add_patch(circ)
+
+    legend_patches = [Patch(facecolor=c, edgecolor='black', label=label) for c, label in zip(class_colors, class_labels)]
+    ax.legend(handles=legend_patches, loc='upper right', bbox_to_anchor=(1.15, 1))
+    
+
+    
+    x_values, y_values = zip(*pos.values())
+    x_min, x_max = min(x_values), max(x_values)
+    y_min, y_max = min(y_values), max(y_values)
+
+    x_range = x_max - x_min
+    y_range = y_max - y_min
+    margin = 0.2 * max(x_range, y_range)  
+
+    ax.set_xlim(x_min - margin, x_max + margin)
+    ax.set_ylim(y_min - margin, y_max + margin)
+
+    ax.set_aspect('equal')
+    ax.axis('off')
+
+    ax.relim()        
+    ax.autoscale()     
+
+    if results_dir is not None:
+        plt.savefig(os.path.join(results_dir, "soft_classification.png"), bbox_inches='tight', dpi=300)
+    
+    plt.show()
+    plt.close()
+
+
+
+def draw_graph_hard_clusters(A, y, class_colors=None, class_labels=None, node_size=None, results_dir=None):
+    """
+    A : (n,n) 
+    y : (n,k) 
+    class_colors : coleurs, facultatives
+    node_size : taille des nodes
+    """
+    n = len(y)
+    k = int(np.max(y))
+
+    if not node_size: 
+        node_size = 6000/n
+
+    if not class_colors:
+        cmap = plt.get_cmap("tab10")
+        class_colors = [mcolors.to_hex(cmap(i % cmap.N)) for i in range(k+1)]
+    
+    if class_labels is None:
+        class_labels = [f"Class {i}" for i in range(k+1)]
+
+    node_colors = [ class_colors[i] for i in y]
+
+    if np.issubdtype(np.array(node_colors).dtype, np.number):
+        cmap = plt.get_cmap("tab10")
+        node_colors = [cmap(v / max(node_colors)) for v in node_colors]
+    
+
+    G = nx.from_numpy_array(A)
+    pos = nx.spring_layout(G, seed=0)
+
+    fig, ax = plt.subplots(figsize=(8,8))
+    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.4)
+    nx.draw_networkx_nodes(G, pos,
+                           node_color=node_colors,
+                           node_size=node_size,
+                           edgecolors='black',
+                           linewidths=0.5,
+                           ax=ax)
+
+
+    for (x, y) in pos.values():
+        circ = plt.Circle((x, y), node_size/30000, fill=False, edgecolor='black', lw=0.5)
+        ax.add_patch(circ)
+
+
+
+    legend_patches = [Patch(facecolor=c, edgecolor='black', label=label) for c, label in zip(class_colors, class_labels)]
+    ax.legend(handles=legend_patches, loc='upper right', bbox_to_anchor=(1.15, 1))
+
+    
+    ax.set_aspect('equal')
+    ax.axis('off')
+
+
+    if results_dir is not None:
+        plt.savefig(os.path.join(results_dir, "hard_clusters.png"), bbox_inches='tight', dpi=300)
+    
+    plt.show()
+    plt.close()
+
+
+
+
+    
+
+
 # ---------------------------------------------------------------------
 # OBJECTIF (ELBO) 
 # ---------------------------------------------------------------------
@@ -562,6 +723,12 @@ def model_selection_over_Q(A, Q_list, subject_name="subject", seed=RANDOM_STATE,
         fit.update({"Q": Q, "AIC": AIC, "BIC": BIC, "ICL": ICL})
         results.append(fit)
 
+        draw_graph_with_probabilities(A, fit["eta"], results_dir=results_dir_Q)
+
+        y_hat = fit["eta"].argmax(axis=1)
+        draw_graph_hard_clusters(A, y_hat, results_dir=results_dir_Q)
+
+
         # Sauvegarde rapide des scores numériques
         with open(os.path.join(results_dir_Q, "scores.txt"), "w") as f:
             f.write(f"AIC: {AIC:.3f}\nBIC: {BIC:.3f}\nICL: {ICL:.3f}\nELBO: {fit['elbo']:.3f}\n")
@@ -779,14 +946,14 @@ def main():
     print(f"{len(files)} matrices détectées dans {DATA_DIR}")
 
     # --- 2. Sélection du sujet ---
-    SUBJECT_IDX = 1
+    SUBJECT_IDX = 5
     A_path = files[SUBJECT_IDX]
     A = load_A(A_path)
     subject_name = os.path.splitext(os.path.basename(A_path))[0].replace("A_", "")
     print(f"Sujet sélectionné : {subject_name}")
 
     # --- 3. Sélection du nombre de clusters ---
-    Q_list = [3, 4, 5, 6]
+    Q_list = [2, 3, 4, 5, 6]
     best, all_results = model_selection_over_Q(A, Q_list, subject_name=subject_name)
 
     # --- 4. Résumé du meilleur modèle ---
@@ -794,6 +961,7 @@ def main():
     print(f"Q optimal (AIC) : {best['Q']}")
     print(f"AIC : {best['AIC']:.2f}   |   BIC : {best['BIC']:.2f}   |   ICL : {best['ICL']:.2f}")
     print(f"η shape : {best['eta'].shape}   |   Π shape : {best['Pi'].shape}")
+
 
     # --- 5. Partition dure (clusters prédits) ---
     y_hat = hard_clusters_from_eta(best["eta"])
