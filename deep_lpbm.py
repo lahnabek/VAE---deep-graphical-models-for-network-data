@@ -1,6 +1,4 @@
 # deep_lpbm_minimal.py
-# Squelette minimal pour répliquer le modèle à partir de matrices .npy déjà prêtes.
-# Pas de classes, scikit-learn quand utile, et TODO à compléter.
 
 import os, json
 import glob
@@ -14,7 +12,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import confusion_matrix, adjusted_rand_score, normalized_mutual_info_score
 from torch_geometric.utils import dense_to_sparse
-
+import seaborn as sns
 import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib.patches import Wedge, Patch
@@ -28,64 +26,196 @@ from class_GCNEncoder import *
 # ---------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------
-
-DATA_DIR =  "miscdata" #"data_numpy_synthetic" 
+MODE = "disassortative"
+DATA_DIR = "data_synthetic/" + MODE# "miscdata" 
 RANDOM_STATE = 42
 HIDDEN_LAYERS_GCN = 32
 MAX_EPOCHS_INIT = 300     # Phase init encodeur (Algorithme 1)
-MAX_EPOCHS = 400          # Phase estimation (Algorithme 1)
-LEARNING_RATE = 1e-2      # Adam lr=0.01 dans l'article
-NUM_SEEDS = 10            # on garde le meilleur ELBO
-CLASS_GCN = "GCNEncoder"  # ou "GCN"
-# ---------------------------------------------------------------------
-# PRÉTRAITEMENT (init k-means etc.)
-# ---------------------------------------------------------------------
-import os
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.cluster import KMeans
+MAX_EPOCHS = 600          # Phase estimation (Algorithme 1)
+LEARNING_RATE = 1e-1   # Adam lr=0.01 dans l'article
+NUM_SEEDS = 5            # on garde le meilleur ELBO
+CLASS_GCN = "GCNEncoder"  # ou "GCN", "GCNEncoder" 
 
-def kmeans_initial_memberships(A, Q, results_dir=None):
+
+# ---------------------------------------------------------------------
+# UTILS
+# ---------------------------------------------------------------------
+
+def init_all_params_dur(A, Q, params, eps=1e-5):
     """
-    - A : NxN binary symmetric adjacency matrix
-    - Q : number of clusters
-    Initialisation douce des appartenances par K-Means sur A.
-    Sauvegarde dans results_dir :
-        - kmeans_init.csv : labels et one-hot
-        - kmeans_init_hist.png : histogramme des clusters initiaux
+    Initialise TOUT pour Deep LPBM :
+      - eta0       : N×Q appartenance douce issue de KMeans (adoucie, stable)
+      - z0         : N×(Q-1) logits initiaux (inverse softmax centré stable)
+      - Pi0        : Q×Q estimation initiale des probabilités de blocs
+      - Pi_tilde0  : Q×Q paramètre non borné (nn.Parameter) pour optimiser Π
+
+    Tout est créé directement sur device, et stocké directement dans params.
     """
-    km = KMeans(n_clusters=Q, n_init="auto", random_state=RANDOM_STATE)
-    labels = km.fit_predict(A)
+
+    device = torch.device(params.get("device", "cpu"))
     N = A.shape[0]
 
-    # One-hot encoding (matrice d’appartenance initiale)
-    C = np.zeros((N, Q))
-    C[np.arange(N), labels] = 1.0
+    A_t = torch.tensor(A, dtype=torch.float32, device=device)
 
-    # --- Sauvegardes ---
-    if results_dir is not None:
-        os.makedirs(results_dir, exist_ok=True)
+    # ===========================
+    # 1) KMEANS → labels
+    # ===========================
+    km = KMeans(n_clusters=Q, n_init="auto", random_state=0).fit(A)
+    labels = torch.from_numpy(km.labels_.astype(int)).to(device)
 
-        # 1) Sauvegarde CSV
-        df = pd.DataFrame({
-            "node_id": np.arange(N),
-            "kmeans_label": labels.astype(int)
-        })
-        csv_path = os.path.join(results_dir, "kmeans_init.csv")
-        df.to_csv(csv_path, index=False)
+    # ===========================
+    # 2) One-hot + adouci (évite extrêmes)
+    # ===========================
+    c = F.one_hot(labels, num_classes=Q).float().to(device)
 
-        # 2) Histogramme des clusters
-        plt.figure()
-        plt.hist(labels, bins=np.arange(Q + 1) - 0.5, rwidth=0.8)
-        plt.xlabel("Cluster K-Means initial")
-        plt.ylabel("Nombre de nœuds")
-        plt.title(f"Répartition initiale K-Means (Q={Q})")
-        plt.tight_layout()
-        plt.savefig(os.path.join(results_dir, "kmeans_init_hist.png"))
-        plt.close()
+    epsi = eps
 
-    return C
+    # eta0 doux : jamais 1, jamais 0
+    eta0 = torch.full_like(c, epsi)
+    eta0[c > 0.9] = 1.0 - (Q - 1) * epsi
+    eta0 = eta0 / eta0.sum(dim=1, keepdim=True)  # normalisation simplex
+
+    # ===========================
+    # 3) z0 = inverse softmax centré
+    # ===========================
+    eta_Q = eta0[:, -1:].clamp_min(epsi)
+    z0 = torch.log(eta0[:, :-1].clamp_min(epsi)) - torch.log(eta_Q)
+
+    # stabilisation : pas de z trop grand
+    z0 = torch.clamp(z0, -10.0, 10.0)
+
+    # ===========================
+    # 4) Estimation stable de Pi0
+    # ===========================
+    Pi0_num = torch.zeros((Q, Q), device=device)
+    Pi0_den = torch.zeros((Q, Q), device=device)
+    upper_mask = torch.triu(torch.ones(N, N, device=device), diagonal=1)
+
+    for q in range(Q):
+        eta_q = eta0[:, q].unsqueeze(1)   # (N,1)
+        for r in range(Q):
+            eta_r = eta0[:, r].unsqueeze(0)  # (1,N)
+            eta_outer = eta_q @ eta_r        # (N,N)
+
+            num = (A_t * eta_outer * upper_mask).sum()
+            den = (eta_outer * upper_mask).sum()
+
+            Pi0_num[q, r] = num
+            Pi0_den[q, r] = den + epsi
+
+    Pi0 = Pi0_num / Pi0_den
+    Pi0 = 0.5 * (Pi0 + Pi0.T)
+
+    # clamp pour stabilité
+    Pi0 = Pi0.clamp(0.05, 0.95)
+
+    # ===========================
+    # 5) Pi_tilde0 = inverse arctan stable
+    # ===========================
+    Pi_tilde0 = torch.tan(np.pi * (Pi0 - 0.5))
+    Pi_tilde0 = torch.clamp(Pi_tilde0, -10.0, 10.0)
+
+    # IMPORTANT : Pi_tilde0 doit être un vrai nn.Parameter
+    Pi_tilde0 = nn.Parameter(Pi_tilde0)
+
+    # ===========================
+    # STOCKAGE DANS params
+    # ===========================
+    params["eta0"]       = eta0
+    params["z0"]         = z0
+    params["Pi0"]        = Pi0
+    params["Pi_tilde0"]  = Pi_tilde0   # directement utilisable dans training
+
+    return eta0, z0, Pi0, Pi_tilde0
+
+def init_all_params(A, Q, params, eps=1e-5, tau=1e-3):
+    """
+    Initialise TOUT pour Deep LPBM (VERSION DOUCE, type ancien code):
+
+      - eta0       : N×Q appartenance douce issue de KMeans (one-hot + tau)
+      - z0         : N×(Q-1) logits initiaux (log((C+tau)/(C_last+tau)))
+      - Pi0        : Q×Q estimation initiale des probabilités de blocs (adoucie)
+      - Pi_tilde0  : Q×Q paramètre non borné (nn.Parameter), stabilisé
+
+    Version empirique STABLE, proche de ton comportement original → ARI élevé.
+    """
+
+    device = torch.device(params.get("device", "cpu"))
+    N = A.shape[0]
+    A_t = torch.tensor(A, dtype=torch.float32, device=device)
+
+    # ===========================
+    # 1) KMEANS → labels
+    # ===========================
+    km = KMeans(n_clusters=Q, n_init="auto", random_state=0).fit(A)
+    labels = torch.from_numpy(km.labels_.astype(int)).to(device)
+
+    # ===========================
+    # 2) One-hot dur → ADOUCISSEMENT "ancien code"
+    # ===========================
+    C = F.one_hot(labels, num_classes=Q).float().to(device)  # shape (N,Q)
+
+    # adoucir légèrement (évite extrêmes, mais garde forme one-hot)
+    eta0 = C * (1 - (Q-1)*tau) + (1 - C) * tau
+    eta0 = eta0 / eta0.sum(dim=1, keepdim=True)  # normalisation simplex
+
+    # ===========================
+    # 3) z0 = LOG-RATIOS (ancienne méthode) + stabilisation
+    # ===========================
+    # z_q = log( (eta_q + tau) / (eta_Q + tau) )
+    denom = eta0[:, [Q-1]] + tau
+    numer = eta0[:, :Q-1] + tau
+    z0 = torch.log(numer) - torch.log(denom)
+
+    # clamp modéré pour éviter z explosifs
+    z0 = torch.clamp(z0, -8.0, 8.0)
+
+    # ===========================
+    # 4) Estimation douce de Pi0 (SBM-like)
+    # ===========================
+    Pi0_num = torch.zeros((Q, Q), device=device)
+    Pi0_den = torch.zeros((Q, Q), device=device)
+    upper_mask = torch.triu(torch.ones(N, N, device=device), diagonal=1)
+
+    for q in range(Q):
+        eta_q = eta0[:, q].unsqueeze(1)      # (N,1)
+        for r in range(Q):
+            eta_r = eta0[:, r].unsqueeze(0)  # (1,N)
+            eta_outer = eta_q @ eta_r        # (N,N)
+
+            num = (A_t * eta_outer * upper_mask).sum()
+            den = (eta_outer * upper_mask).sum()
+
+            Pi0_num[q, r] = num
+            Pi0_den[q, r] = den + eps
+
+    Pi0 = Pi0_num / Pi0_den
+    Pi0 = 0.5 * (Pi0 + Pi0.T)
+
+    # clamp léger : Pi0 jamais trop extrême
+    Pi0 = Pi0.clamp(0.05, 0.95)
+
+    # ===========================
+    # 5) Pi_tilde0 = inverse arctan (stabilisé)
+    # ===========================
+    Pi_tilde0 = torch.tan(np.pi * (Pi0 - 0.5))
+
+    # clamp Pĩ0 pour éviter explosions au tout début
+    Pi_tilde0 = torch.clamp(Pi_tilde0, -8.0, 8.0)
+
+    # convertir en nn.Parameter directement ici
+    Pi_tilde0 = nn.Parameter(Pi_tilde0)
+
+    # ===========================
+    # Stockage dans params
+    # ===========================
+    params["eta0"]       = eta0
+    params["z0"]         = z0
+    params["Pi0"]        = Pi0
+    params["Pi_tilde0"]  = Pi_tilde0
+
+    return eta0, z0, Pi0, Pi_tilde0
+
 
 def softmax_logits_to_eta(z):
     """
@@ -101,11 +231,6 @@ def softmax_logits_to_eta(z):
     eta = e / (e.sum(dim=1, keepdim=True) + eps)
     return eta
 
-
-# ---------------------------------------------------------------------
-# UTILS
-# ---------------------------------------------------------------------
-
 def reparameterize(mu, logvar):
     """
     Reparametrization trick : z = mu + sigma * eps.
@@ -114,6 +239,9 @@ def reparameterize(mu, logvar):
     eps = torch.randn_like(mu)
     sigma = torch.exp(0.5 * logvar).expand_as(mu)
     return mu + sigma * eps
+
+
+
 
 def unconstrained_Pi_to_Pi(Pi_tilde):
     """
@@ -148,25 +276,19 @@ def init_encoder_phase(A, Q, params, results_dir=None):
         os.makedirs(results_dir, exist_ok=True)
 
     # --- Modèle GCN (créé une fois et stocké dans params)
-    gcn = params.get("gcn")
-    if gcn is None:
-        gcn = GCN(in_feats=1, hidden=hidden, out_mu=Q-1, out_lv=1).to(device)
-        params["gcn"] = gcn
+    gcn = GCN(in_feats=N, hidden=hidden, out_mu=Q-1, out_lv=1).to(device)
+        
 
     # --- Optimiseur pour la phase d'init
-    opt = params.get("opt_init")
-    if opt is None:
-        opt = torch.optim.Adam(gcn.parameters(), lr=init_lr)
-        params["opt_init"] = opt
+    opt = torch.optim.Adam(gcn.parameters(), lr=init_lr)
+
 
     # --- Tenseurs d’entrée
     A_t = torch.tensor(A, dtype=torch.float32, device=device)
-    X   = torch.ones((N, 1), dtype=torch.float32, device=device)
+    X   = torch.eye(N, dtype=torch.float32, device=device)
 
     # --- Initialisation douce via KMeans ---
-    C = kmeans_initial_memberships(A, Q, results_dir=results_dir)
-    z0_np   = np.log((C[:, :Q-1] + tau) / (C[:, [Q-1]] + tau))
-    z0      = torch.tensor(z0_np, dtype=torch.float32, device=device)
+    eta0, z0, Pi0, Pi_tilde0 = init_all_params(A, Q, params)
     lv_star = torch.full((N, 1), np.log(0.01), dtype=torch.float32, device=device)
 
     # --- Boucle d’entraînement (phase d’init) ---
@@ -183,7 +305,7 @@ def init_encoder_phase(A, Q, params, results_dir=None):
         loss_history.append(float(loss.detach().cpu()))
 
     last_loss = loss_history[-1] if loss_history else None
-
+    params["gcn"] = gcn
     # --- Sauvegarde de la courbe de loss ---
     if results_dir is not None:
         plt.figure()
@@ -232,21 +354,18 @@ def init_encoder_phase_GCNEncoder(A, Q, params, results_dir=None):
     X = torch.eye(N, dtype=torch.float32, device=device)
 
     # --- Modèle GCN (créé une seule fois et stocké dans params)
-    gcn = params.get("gcn")
-    if gcn is None:
-        gcn = GCNEncoder(in_feats=N, hidden=hidden, out_mu=Q-1, out_lv=1).to(device)
-        params["gcn"] = gcn
+    gcn = GCNEncoder(in_feats=N, hidden=hidden, out_mu=Q-1, out_lv=1).to(device)
+    
 
     # --- Optimiseur pour la phase d'init
-    opt = params.get("opt_init")
-    if opt is None:
-        opt = torch.optim.Adam(gcn.parameters(), lr=init_lr)
-        params["opt_init"] = opt
+    opt = torch.optim.Adam(gcn.parameters(), lr=init_lr)
+    
 
     # --- Initialisation douce via KMeans ---
-    C = kmeans_initial_memberships(A, Q, results_dir=results_dir)
-    z0_np   = np.log((C[:, :Q-1] + tau) / (C[:, [Q-1]] + tau))
-    z0      = torch.tensor(z0_np, dtype=torch.float32, device=device)
+    eta0, z0, Pi0, Pi_tilde0 = init_all_params(A, Q, params)
+    # Sauvegarde debug
+    save_init_debug_figures(A, eta0, z0, Pi0, Pi_tilde0, results_dir)
+
     lv_star = torch.full((N, 1), np.log(0.01), dtype=torch.float32, device=device)
 
     # --- Boucle d’entraînement (phase d’init) ---
@@ -269,6 +388,7 @@ def init_encoder_phase_GCNEncoder(A, Q, params, results_dir=None):
 
     last_loss = loss_history[-1] if loss_history else None
 
+    params["gcn"] = gcn
     # --- Sauvegarde de la courbe de loss ---
     if results_dir is not None:
         plt.figure()
@@ -296,6 +416,83 @@ def decoder_prob(Z, Pi, eps=1e-8):
     P = torch.clamp(P, eps, 1 - eps)                  # stabilité num.
     return P
 
+
+# -----------------------------------------------------------
+# DEBUG INIT
+# -----------------------------------------------------------
+def make_debug_dir(results_dir, name="init_debug"):
+    debug_dir = os.path.join(results_dir, name)
+    os.makedirs(debug_dir, exist_ok=True)
+    return debug_dir
+
+
+
+def save_init_debug_figures(A, eta0, z0, Pi0, Pi_tilde0, results_dir):
+
+    debug_dir = make_debug_dir(results_dir)
+
+    # --- FIGURE 1 : Heatmap de eta0 ---
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(eta0.cpu().numpy(), cmap="viridis")
+    plt.title("η₀ (initial soft memberships)")
+    plt.xlabel("Cluster q")
+    plt.ylabel("Node i")
+    plt.tight_layout()
+    plt.savefig(os.path.join(debug_dir, "eta0_heatmap.png"))
+    plt.close()
+
+    # --- FIGURE 2 : Heatmap de z0 ---
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(z0.cpu().numpy(), cmap="coolwarm", center=0)
+    plt.title("z₀ (initial logits)")
+    plt.xlabel("Dim q")
+    plt.ylabel("Node i")
+    plt.tight_layout()
+    plt.savefig(os.path.join(debug_dir, "z0_heatmap.png"))
+    plt.close()
+
+    # --- FIGURE 3 : Histogramme des z0 ---
+    plt.figure(figsize=(6, 5))
+    plt.hist(z0.cpu().numpy().flatten(), bins=40)
+    plt.title("Distribution de z₀")
+    plt.tight_layout()
+    plt.savefig(os.path.join(debug_dir, "z0_histogram.png"))
+    plt.close()
+
+    # --- FIGURE 4 : Heatmap de Pi0 ---
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(Pi0.cpu().numpy(), annot=True, fmt=".2f", cmap="viridis")
+    plt.title("Π₀ (initial block matrix)")
+    plt.xlabel("Cluster r")
+    plt.ylabel("Cluster q")
+    plt.tight_layout()
+    plt.savefig(os.path.join(debug_dir, "Pi0_heatmap.png"))
+    plt.close()
+
+    # --- FIGURE 5 : Heatmap de Pĩ0 ---
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(Pi_tilde0.detach().cpu().numpy(), cmap="coolwarm", center=0)
+    plt.title("Π̃₀ (initial unconstrained block matrix)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(debug_dir, "Pi_tilde0_heatmap.png"))
+    plt.close()
+
+    # --- FIGURE 6 : Histogramme KMeans init ---
+    labels = eta0.argmax(dim=1).cpu().numpy()
+    plt.figure(figsize=(5, 4))
+    plt.hist(labels, bins=np.arange(eta0.shape[1]+1)-0.5, rwidth=0.8)
+    plt.xlabel("Cluster")
+    plt.ylabel("Count")
+    plt.title("Histogramme des clusters KMeans initiaux")
+    plt.tight_layout()
+    plt.savefig(os.path.join(debug_dir, "kmeans_hist.png"))
+    plt.close()
+
+    
+
+# -----------------------------------------------------------
+# REPRESENTATION
+# -----------------------------------------------------------
 def plot_elbo_curve(elbo_history, Q, save_dir):
     """Affiche et enregistre la courbe ELBO."""
     if elbo_history is None or len(elbo_history) == 0:
@@ -341,11 +538,6 @@ def save_all_figures(results_dir, best, Q):
     plot_elbo_curve(best.get("history"), Q, results_dir)
     plot_Pi_matrix(best["Pi"], Q, results_dir)
     plot_eta_histogram(best["eta"], Q, results_dir)
-
-
-# -----------------------------------------------------------
-# REPRESENTATION
-# -----------------------------------------------------------
 
 
 def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, node_radius=None, results_dir=None):
@@ -502,23 +694,15 @@ def draw_graph_hard_clusters(A, y, class_colors=None, class_labels=None, node_si
 
 
 def elbo_stub(A, P, mu, logvar):
-    """
-    - A      : N×N binaire symétrique
-    - P      : N×N probas d’arête (sorties du décodeur)
-    - mu     : N×(Q−1) (moyennes de q)
-    - logvar : N×1 ou N×(Q−1) (log-variances de q)
-    Retourne ELBO = log p(A|P) − KL[q(Z)||p(Z)]. Sec. 4.
-    """
-    # log-vraisemblance Bernoulli sur i<j
-    ij = np.triu_indices_from(A, k=1)
-    ll = (A[ij] * torch.log(P[ij]) + (1 - A[ij]) * torch.log(1 - P[ij])).sum()
+    ij = np.triu_indices(A.shape[0], 1)
+    ll = (A[ij] * torch.log(P[ij]) + (1-A[ij]) * torch.log(1-P[ij])).sum()
 
-    # KL(q||p) pour q = N(mu, diag(sigma^2)), p = N(0, I)
+    # Variance isotrope → logvar shape (N,1)
+    sigma2 = torch.exp(logvar)   # (N,1)
+    kl = 0.5 * (sigma2 + mu**2 - 1 - logvar).sum()
 
-    sigma2 = torch.exp(logvar).expand_as(mu)
-    kl = 0.5 * (sigma2 + mu**2 - 1.0 - logvar.expand_as(mu)).sum()
+    return ll - kl
 
-    return ll - kl # elbo
 
 
 # ---------------------------------------------------------------------
@@ -537,15 +721,15 @@ def train_deep_lpbm_GCN(A, Q, seed=RANDOM_STATE, results_dir=None):
         init_encoder_phase(A, Q, params, results_dir)
 
         gcn = params["gcn"]
-
-        Pi_tilde = torch.zeros((Q, Q), dtype=torch.float32, device=device, requires_grad=True)
+        Pi_tilde = params["Pi_tilde0"]
+        #Pi_tilde = torch.zeros((Q, Q), dtype=torch.float32, device=device, requires_grad=True)
         opt = torch.optim.Adam(list(gcn.parameters()) + [Pi_tilde], lr=LEARNING_RATE)
 
         elbo_history = []
         gcn.train()
         for _ in range(MAX_EPOCHS):
             opt.zero_grad()
-            X = torch.ones((A_t.size(0), 1), dtype=torch.float32, device=device)
+            X = torch.eye(A_t.size(0), dtype=torch.float32, device=device)
             mu, logvar = gcn(A_t, X)
             z = reparameterize(mu, logvar)
             Pi = unconstrained_Pi_to_Pi(Pi_tilde)
@@ -560,9 +744,9 @@ def train_deep_lpbm_GCN(A, Q, seed=RANDOM_STATE, results_dir=None):
         # Évaluation finale
         gcn.eval()
         with torch.no_grad():
-            X = torch.ones((A_t.size(0), 1), dtype=torch.float32, device=device)
+            X = torch.eye(A_t.size(0), dtype=torch.float32, device=device)
             mu, logvar = gcn(A_t, X)
-            z = mu
+            z = reparameterize(mu, logvar)
             eta = softmax_logits_to_eta(z).cpu().numpy()
             Pi = unconstrained_Pi_to_Pi(Pi_tilde).cpu().numpy()
 
@@ -606,7 +790,8 @@ def train_deep_lpbm_GCNEncoder(A, Q, seed=RANDOM_STATE, results_dir=None):
         gcn = params["gcn"]  # ta classe GCN (avec GCNConv)
 
         # Paramètres du LPBM
-        Pi_tilde = torch.zeros((Q, Q), dtype=torch.float32, device=device, requires_grad=True)
+        Pi_tilde = params["Pi_tilde0"]
+        #Pi_tilde = torch.zeros((Q, Q), dtype=torch.float32, device=device, requires_grad=True)
         opt = torch.optim.Adam(list(gcn.parameters()) + [Pi_tilde], lr=LEARNING_RATE)
 
         elbo_history = []
@@ -636,7 +821,7 @@ def train_deep_lpbm_GCNEncoder(A, Q, seed=RANDOM_STATE, results_dir=None):
         gcn.eval()
         with torch.no_grad():
             mu, logvar = gcn(X, edge_index)
-            z = mu
+            z = reparameterize(mu, logvar)
             eta = softmax_logits_to_eta(z).cpu().numpy()
             Pi = unconstrained_Pi_to_Pi(Pi_tilde).cpu().numpy()
 
@@ -674,14 +859,6 @@ def loglikelihood_A_given_eta_Pi(A, eta, Pi):
     return float(ll)
 
 
-def count_parameters(N, Q):
-    """
-    Comptes ν_{N,Q} et ν_{N,Q,Π} comme dans l’article (Sec. 4.3).
-    """
-    nu_NQ = Q*(Q+1) + N*(Q-1)
-    nu_NQ_Pi = int(0.5*Q*(Q+1))
-    Nobs = int(0.5*N*(N-1))
-    return nu_NQ, nu_NQ_Pi, Nobs
 
 def compute_AIC_BIC_ICL(A, eta, Pi):
     """
@@ -691,7 +868,9 @@ def compute_AIC_BIC_ICL(A, eta, Pi):
     N = A.shape[0]
     Q = eta.shape[1]
     ll_A = loglikelihood_A_given_eta_Pi(A, eta, Pi)
-    nu_NQ, nu_NQ_Pi, Nobs = count_parameters(N, Q)
+    nu_NQ = Q*(Q+1) + N*(Q-1)
+    nu_NQ_Pi = 0.5*Q*(Q+1)
+    Nobs = 0.5*N*(N-1)
 
     AIC = ll_A - nu_NQ
     BIC = ll_A - 0.5*nu_NQ*np.log(Nobs)
@@ -699,6 +878,48 @@ def compute_AIC_BIC_ICL(A, eta, Pi):
     ICL = ll_A - 0.5*nu_NQ_Pi*np.log(Nobs)
     return AIC, BIC, ICL
 
+def collapse_small_clusters(eta, min_size_ratio=0.03):
+    """
+    Prend une matrice d'appartenance partielle η (N×Q)
+    → détecte les clusters trop petits (<3%)
+    → redistribue leurs nœuds vers le cluster suivant le plus probable
+    → retourne une nouvelle η_collapsed (même taille N×Q)
+    """
+    N, Q = eta.shape
+    min_size = max(1, int(min_size_ratio * N))
+
+    # assignation dure
+    y = eta.argmax(axis=1)
+    
+    # taille des clusters
+    counts = np.bincount(y, minlength=Q)
+    small = np.where(counts < min_size)[0]
+
+    if len(small) == 0:
+        return eta  # rien à faire
+
+    eta_new = eta.copy()
+
+    for sc in small:
+        nodes = np.where(y == sc)[0]
+        if len(nodes) == 0:
+            continue
+
+        # pour ces noeuds, prendre la 2e proba la plus forte
+        for i in nodes:
+            # trier par probas décroissantes
+            order = np.argsort(eta[i])[::-1]
+            # prendre la plus grande ≠ sc
+            for alt in order:
+                if alt != sc:
+                    eta_new[i, sc] = 0.0
+                    eta_new[i, alt] = 1.0
+                    break
+
+    # renormalisation simple (pas toujours nécessaire car one-hot)
+    eta_new = eta_new / eta_new.sum(axis=1, keepdims=True)
+    print("collapsed!")
+    return eta_new
 
 
 def model_selection_over_Q(A, Q_list, subject_name="subject", seed=RANDOM_STATE, CLASS_GCN = CLASS_GCN):
@@ -710,7 +931,7 @@ def model_selection_over_Q(A, Q_list, subject_name="subject", seed=RANDOM_STATE,
     os.makedirs(results_dir_base, exist_ok=True)
 
     results = []
-
+    AIC_log = []
     for Q in Q_list:
         print(f"\n=== Entraînement pour Q = {Q} ===")
         results_dir_Q = os.path.join(results_dir_base, f"Q_{Q}")
@@ -719,14 +940,20 @@ def model_selection_over_Q(A, Q_list, subject_name="subject", seed=RANDOM_STATE,
         if CLASS_GCN == "GCNEncoder":
             fit = train_deep_lpbm_GCNEncoder(A, Q, seed=seed, results_dir=results_dir_Q)
         
+        # collapse éventuel des petits clusters
+        eta_collapsed = collapse_small_clusters(fit["eta"], min_size_ratio=0.03)
+        fit["eta"] = eta_collapsed
+
+        # recalcul des critères d'information
         AIC, BIC, ICL = compute_AIC_BIC_ICL(A, fit["eta"], fit["Pi"])
+        AIC_log.append(AIC)
         fit.update({"Q": Q, "AIC": AIC, "BIC": BIC, "ICL": ICL})
         results.append(fit)
 
-        draw_graph_with_probabilities(A, fit["eta"], results_dir=results_dir_Q)
+        #draw_graph_with_probabilities(A, fit["eta"], results_dir=results_dir_Q)
 
         y_hat = fit["eta"].argmax(axis=1)
-        draw_graph_hard_clusters(A, y_hat, results_dir=results_dir_Q)
+        #draw_graph_hard_clusters(A, y_hat, results_dir=results_dir_Q)
 
 
         # Sauvegarde rapide des scores numériques
@@ -736,6 +963,22 @@ def model_selection_over_Q(A, Q_list, subject_name="subject", seed=RANDOM_STATE,
     # Sélection du meilleur modèle selon AIC (comme recommandé dans l’article)
     best = max(results, key=lambda d: d["AIC"])
     best_Q = best["Q"]
+
+    plt.figure(figsize=(6, 4))
+
+    plt.plot(Q_list, AIC_log, marker='o')
+    plt.vlines(best_Q, ymin=min(AIC_log), ymax=max(AIC_log),
+            color='red', linestyle='--', label='Best Q')
+
+    plt.title("AIC values for each tested Q")
+    plt.xlabel("Number of clusters Q")
+    plt.ylabel("AIC")
+    plt.legend()
+    plt.tight_layout()
+
+    os.makedirs(results_dir_base, exist_ok=True)
+    plt.savefig(os.path.join(results_dir_base, "AIC_over_Q.png"))
+    plt.close()
 
 
     return best, results
@@ -757,14 +1000,11 @@ def H_partial_memberships_score(eta_true, eta_hat):
     sommée sur i<j (paires uniques), invariante aux permutations de clusters.
     """
     eps = 1e-12
-    # (optionnel) sécure: renormalise au cas où les lignes ne somment pas exactement à 1
-    eta_true = eta_true / (eta_true.sum(axis=1, keepdims=True) + eps)
-    eta_hat  = eta_hat  / (eta_hat.sum(axis=1, keepdims=True)  + eps)
-
+    
     U_true = eta_true @ eta_true.T
     U_hat  = eta_hat  @ eta_hat.T
     N = eta_true.shape[0]
-    tri = np.triu_indices(N, k=1)  # i<j, exclut la diagonale
+    tri = np.triu_indices(N, k=0)  # i<j, exclut la diagonale
     diff = np.abs(U_true - U_hat)[tri]
     return np.sqrt(2.0/(N*(N-1))) * diff.sum()
 
@@ -831,36 +1071,48 @@ def global_clustering_scores(y_true, y_pred):
     return ari, nmi
 
 
-def evaluate_clustering(y_true=None, y_pred=None, eta_true=None, eta_hat=None):
+def evaluate_clustering(y_true=None, y_pred=None,
+                        eta_true=None, eta_hat=None,
+                        Pi_true=None, Pi_pred=None):
     """
-    Évalue un clustering (dure ou partiel).
-    Si y_true/y_pred fournis → évalue via ARI, NMI, confusion matrix.
-    Si eta_true/eta_hat fournis → évalue via H et ARI/NMI sur les argmax.
+    Évalue un clustering dur ou partiel + compare Pi_true / Pi_pred si fournis.
     """
     print("=== Évaluation du modèle ===")
+
+    # ---- Comparaison des matrices Π si présentes ----
+    if (Pi_true is not None) and (Pi_true.shape == Pi_pred.shape) :
+        diff = np.abs(Pi_true - Pi_pred).mean()
+        print(f"\n=== Comparaison Π ===")
+        print(f"Différence moyenne |Π_true - Π_pred| = {diff:.4f}")
+        print(f"Shape Π_true = {Pi_true.shape} | Shape Π_pred = {Pi_pred.shape}")
 
     # ---- Cas des appartenances partielles ----
     if eta_true is not None and eta_hat is not None:
         H = H_partial_memberships_score(eta_true, eta_hat)
         y_true_hard = hard_clusters_from_eta(eta_true)
         y_pred_hard = hard_clusters_from_eta(eta_hat)
-        print(f" Score H (appartenances partielles) = {H:.4f}")
-        y_true, y_pred = y_true_hard, y_pred_hard  # pour continuer les métriques globales
+        print(f"\nScore H (appartenances partielles) = {H:.4f}")
+        y_true, y_pred = y_true_hard, y_pred_hard
 
     # ---- Cas des labels durs ----
     if y_true is not None and y_pred is not None:
         cm, mapping, y_aligned = confusion_matrix_permuted(y_true, y_pred)
+
+        labels = sorted(set(y_true) | set(y_pred))
+
         df = pd.DataFrame(
             cm,
-            index=[f"True {c}" for c in np.unique(y_true)],
-            columns=[f"Pred {c}" for c in np.unique(y_true)]
+            index=[f"True {c}" for c in labels],
+            columns=[f"Pred {c}" for c in labels]
         )
+
+
         ari = adjusted_rand_score(y_true, y_pred)
         nmi = normalized_mutual_info_score(y_true, y_pred)
 
-        
         print("\n=== Matrice de confusion ===")
         print(df)
+
         print("\n=== Scores globaux ===")
         print(f"ARI = {ari:.3f}")
         print(f"NMI = {nmi:.3f}")
@@ -875,15 +1127,13 @@ def evaluate_clustering(y_true=None, y_pred=None, eta_true=None, eta_hat=None):
         print(" Fournis au moins y_true/y_pred ou eta_true/eta_hat.")
 
 
-def save_node_assignments(y_true, y_pred, mapping, A_path, results_root="results"):
+def save_node_assignments(y_true, y_pred, mapping, subject_name,  results_root="results"):
     """
     Enregistre les assignations vraies/prédites des noeuds dans le dossier results/<patient>/assignments/.
     Le nom du fichier correspond à la matrice observée (ex: results/subject01/assignments/subject01.json).
     """
     # --- Préparation du dossier ---
-    base = os.path.splitext(os.path.basename(A_path))[0]
-    patient_name = base.replace("A_", "")  # ex: A_subject01.npy -> subject01
-    out_dir = os.path.join(results_root, patient_name, "assignments")
+    out_dir = os.path.join(results_root, subject_name, "assignments")
     os.makedirs(out_dir, exist_ok=True)
 
     # --- Applique la permutation optimale aux prédictions ---
@@ -899,8 +1149,8 @@ def save_node_assignments(y_true, y_pred, mapping, A_path, results_root="results
     df = pd.DataFrame(data)
 
     # --- Noms des fichiers ---
-    json_path = os.path.join(out_dir, f"{patient_name}.json")
-    csv_path  = os.path.join(out_dir, f"{patient_name}.csv")
+    json_path = os.path.join(out_dir, f"{subject_name}.json")
+    csv_path  = os.path.join(out_dir, f"{subject_name}.csv")
 
     # --- Sauvegarde ---
     with open(json_path, "w") as f:
@@ -913,48 +1163,40 @@ def save_node_assignments(y_true, y_pred, mapping, A_path, results_root="results
 # PIPELINE EXEMPLE (consomme tes .npy)
 # ---------------------------------------------------------------------
 
-
-
-
-def list_npy_graphs(data_dir: str):
+def save_Pi_comparison(Pi_true, Pi_pred, outpath):
     """
-    Retourne les chemins des fichiers .npy dont le nom commence par 'A'.
+    Crée et sauvegarde une figure comparant Π_true et Π_pred.
     """
-    return sorted(glob.glob(os.path.join(data_dir, "A*.npy")))
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
-def load_A(path: str, as_bool: bool = True, validate: bool = True):
-    """
-    Charge une matrice A (carrée, symétrique, diag=0 si validate).
-    as_bool: binarise A (uint8) si True.
-    """
-    A = np.load(path)
-    if validate:
-        assert A.ndim == 2 and A.shape[0] == A.shape[1], "A doit être carrée."
-        if np.issubdtype(A.dtype, np.floating):
-            assert np.allclose(A, A.T, atol=1e-8), "A doit être symétrique."
-        else:
-            assert (A == A.T).all(), "A doit être symétrique."
-        assert np.allclose(np.diag(A), 0), "diag(A) doit être nulle."
-    if as_bool:
-        A = (A != 0).astype(np.uint8)
-    return A
+    im0 = axes[0].imshow(Pi_true, cmap="viridis")
+    axes[0].set_title("Π vraie (ground truth)")
+    plt.colorbar(im0, ax=axes[0], fraction=0.046)
+
+    im1 = axes[1].imshow(Pi_pred, cmap="viridis")
+    axes[1].set_title("Π prédite (Deep LPBM)")
+    plt.colorbar(im1, ax=axes[1], fraction=0.046)
+
+    plt.suptitle("Comparaison des matrices Π", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=200)
+    plt.close()
+
 
 def main():
-    # --- 1. Chargement des fichiers ---
-    files = list_npy_graphs(DATA_DIR)
-    assert len(files) > 0, f"Aucun fichier .npy trouvé dans {DATA_DIR}"
-    print(f"{len(files)} matrices détectées dans {DATA_DIR}")
-
     # --- 2. Sélection du sujet ---
-    SUBJECT_IDX = 5
-    A_path = files[SUBJECT_IDX]
-    A = load_A(A_path)
+    SUBJECT_IDX = 3
+    A_filename = f"A_{SUBJECT_IDX:03d}.npy"     
+    A_path = os.path.join(DATA_DIR, A_filename) 
+
+    A = np.load(A_path)
+    
     subject_name = os.path.splitext(os.path.basename(A_path))[0].replace("A_", "")
-    print(f"Sujet sélectionné : {subject_name}")
+    print(f"Sujet sélectionné : {subject_name} dans le dossier {DATA_DIR}")
 
     # --- 3. Sélection du nombre de clusters ---
-    Q_list = [2, 3, 4, 5, 6]
-    best, all_results = model_selection_over_Q(A, Q_list, subject_name=subject_name)
+    Q_list = [6,5,4,3]
+    best, all_results = model_selection_over_Q(A, Q_list, subject_name=MODE + subject_name)
 
     # --- 4. Résumé du meilleur modèle ---
     print("\n=== Meilleur modèle ===")
@@ -965,9 +1207,13 @@ def main():
 
     # --- 5. Partition dure (clusters prédits) ---
     y_hat = hard_clusters_from_eta(best["eta"])
+    Pi = best['Pi']
 
     # --- 6. Recherche d’un fichier y_* pour vérifier s’il s’agit de données synthétiques ---
     y_path = os.path.join(DATA_DIR, os.path.basename(A_path).replace("A_", "y_"))
+    Pi_path = os.path.join(DATA_DIR, os.path.basename(A_path).replace("A_", "Pi_"))
+    eta_path = os.path.join(DATA_DIR, os.path.basename(A_path).replace("A_", "eta_"))
+    
     if os.path.exists(y_path):
         print("\n=== Données synthétiques détectées ===")
         y = np.load(y_path).astype(int).ravel()
@@ -975,25 +1221,35 @@ def main():
         print(f"K vrai : {K_true}   |   Q trouvé : {best['Q']}")
 
         # --- 7. Création de η* (one-hot de y vrai) ---
-        eta_true = np.eye(K_true, dtype=float)[y]
+        eta_true = np.load(eta_path)
+        Pi_true = np.load(Pi_path)
 
-        # --- 8. Évaluation complète ---
+        # --- 8. Évaluation ---
         evaluate_clustering(
             y_true=y,
             y_pred=y_hat,
             eta_true=eta_true,
-            eta_hat=best["eta"]
+            eta_hat=best["eta"],
+            Pi_true=Pi_true,
+            Pi_pred=Pi
         )
 
-        # --- 9. Sauvegarde des assignations (dans results/<subject>/assignments/) ---
+        # --- 9. Sauvegarde des assignations ---
         save_node_assignments(
             y_true=y,
             y_pred=y_hat,
             mapping=best_label_permutation(y, y_hat),
-            A_path=A_path,
+            subject_name=MODE + subject_name,
             results_root="results"
         )
 
+        # --- 10. Sauvegarde de Π vraie et prédite ---
+    
+        results_dir = os.path.join("results", MODE + subject_name)
+        os.makedirs(results_dir, exist_ok=True)
+
+        fig_path = os.path.join(results_dir, "Pi_comparison.png")
+        save_Pi_comparison(Pi_true, Pi, fig_path)
     else:
         # --- Cas réel : pas de vérité terrain ---
         print("\n=== Données réelles ===")
