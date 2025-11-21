@@ -130,11 +130,11 @@ def generate_synthetic(outdir="data_synthetic",
 
 if __name__ == "__main__":
     # Exemple : générer 10 graphes disassortatifs
-    generate_synthetic(mode="hub", #assortative, hub, disassortative
+    generate_synthetic(mode="disassortative", #assortative, hub, disassortative
                        outdir="data_synthetic",
                        n_graphs=10,
                        N=200,
-                       Q=3,
+                       Q=5,
                        beta=0.3,
                        eps=0.05,
                        zeta=1.0, # 1 for hard clustering and in (0,1) for partial

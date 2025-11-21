@@ -23,20 +23,28 @@ import matplotlib.colors as mcolors
 
 from class_GCN import *
 from class_GCNEncoder import *
+from class_GCN_Multi_layers import *
 # ---------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------
-MODE = "disassortative"
+MODE = "assortative" # disassortative, assortative, hub
 DATA_DIR = "data_synthetic/" + MODE# "miscdata" 
 RANDOM_STATE = 42
-HIDDEN_LAYERS_GCN = 32
+HIDDEN_LAYERS_GCN = [ 32]
+SPLITLAYER = False
 MAX_EPOCHS_INIT = 300     # Phase init encodeur (Algorithme 1)
 MAX_EPOCHS = 600          # Phase estimation (Algorithme 1)
-LEARNING_RATE = 1e-1   # Adam lr=0.01 dans l'article
+LEARNING_RATE = 1e-2   # Adam lr=0.01 dans l'article
 NUM_SEEDS = 5            # on garde le meilleur ELBO
-CLASS_GCN = "GCNEncoder"  # ou "GCN", "GCNEncoder" 
+CLASS_GCN = "GCNEncoder"  #  "GCNEncoder" , 
+SUBJECT_IDX = 1
+METRIC = "AIC" # AIC, BIC, ICL
 
-
+"""
+ancienne config GCN 2 couches de l'article, marche bien sur Q=3 mais pas au dela:
+HIDDEN_LAYERS_GCN = [32]
+SPLITLAYER = False
+"""
 # ---------------------------------------------------------------------
 # UTILS
 # ---------------------------------------------------------------------
@@ -128,7 +136,8 @@ def init_all_params_dur(A, Q, params, eps=1e-5):
 
     return eta0, z0, Pi0, Pi_tilde0
 
-def init_all_params(A, Q, params, eps=1e-5, tau=1e-3):
+def init_all_params(A, Q, params, eps=1e-6, tau=1e-16):
+    # tester : prior dirichlet sur eta
     """
     Initialise TOUT pour Deep LPBM (VERSION DOUCE, type ancien code):
 
@@ -162,13 +171,13 @@ def init_all_params(A, Q, params, eps=1e-5, tau=1e-3):
     # ===========================
     # 3) z0 = LOG-RATIOS (ancienne méthode) + stabilisation
     # ===========================
-    # z_q = log( (eta_q + tau) / (eta_Q + tau) )
+    
     denom = eta0[:, [Q-1]] + tau
     numer = eta0[:, :Q-1] + tau
     z0 = torch.log(numer) - torch.log(denom)
 
     # clamp modéré pour éviter z explosifs
-    z0 = torch.clamp(z0, -8.0, 8.0)
+    z0 = torch.clamp(z0, -8.0, 8.0) # excessif avec toutes les protections
 
     # ===========================
     # 4) Estimation douce de Pi0 (SBM-like)
@@ -201,7 +210,7 @@ def init_all_params(A, Q, params, eps=1e-5, tau=1e-3):
     Pi_tilde0 = torch.tan(np.pi * (Pi0 - 0.5))
 
     # clamp Pĩ0 pour éviter explosions au tout début
-    Pi_tilde0 = torch.clamp(Pi_tilde0, -8.0, 8.0)
+    #Pi_tilde0 = torch.clamp(Pi_tilde0, -8.0, 8.0)
 
     # convertir en nn.Parameter directement ici
     Pi_tilde0 = nn.Parameter(Pi_tilde0)
@@ -263,7 +272,7 @@ def init_encoder_phase(A, Q, params, results_dir=None):
         - courbe de perte d'initialisation init_loss.png
     """
     device   = torch.device(params.get("device", "cpu"))
-    hidden   = int(params.get("hidden", HIDDEN_LAYERS_GCN))
+    hidden   = (params.get("hidden", HIDDEN_LAYERS_GCN))
     init_lr  = float(params.get("init_lr", LEARNING_RATE))
     seed     = int(params.get("seed", RANDOM_STATE))
     tau      = float(params.get("init_tau", 1e-3))
@@ -276,8 +285,9 @@ def init_encoder_phase(A, Q, params, results_dir=None):
         os.makedirs(results_dir, exist_ok=True)
 
     # --- Modèle GCN (créé une fois et stocké dans params)
-    gcn = GCN(in_feats=N, hidden=hidden, out_mu=Q-1, out_lv=1).to(device)
-        
+    #gcn = GCN(in_feats=N, hidden=hidden, out_mu=Q-1, out_lv=1).to(device)
+    gcn = GCNMultiLayers(in_feats=N, hidden=hidden, out_mu=Q-1, out_lv=1, split_last_layer=SPLITLAYER).to(device)
+    
 
     # --- Optimiseur pour la phase d'init
     opt = torch.optim.Adam(gcn.parameters(), lr=init_lr)
@@ -334,7 +344,7 @@ def init_encoder_phase_GCNEncoder(A, Q, params, results_dir=None):
         - courbe de perte d'initialisation init_loss.png
     """
     device   = torch.device(params.get("device", "cpu"))
-    hidden   = int(params.get("hidden", HIDDEN_LAYERS_GCN))
+    hidden   = int(params.get("hidden", HIDDEN_LAYERS_GCN[0]))
     init_lr  = float(params.get("init_lr", LEARNING_RATE))
     seed     = int(params.get("seed", RANDOM_STATE))
     tau      = float(params.get("init_tau", 1e-3))
@@ -785,7 +795,8 @@ def train_deep_lpbm_GCNEncoder(A, Q, seed=RANDOM_STATE, results_dir=None):
 
         # Initialisation du modèle GCN (défini ailleurs avec GCNConv)
         params = {"Q": Q, "seed": seed + s, "device": device,
-                  "hidden": HIDDEN_LAYERS_GCN, "init_lr": LEARNING_RATE}
+                  "hidden": HIDDEN_LAYERS_GCN[0] #attend un entier
+                  , "init_lr": LEARNING_RATE}
         init_encoder_phase_GCNEncoder(A, Q, params, results_dir)
         gcn = params["gcn"]  # ta classe GCN (avec GCNConv)
 
@@ -961,7 +972,7 @@ def model_selection_over_Q(A, Q_list, subject_name="subject", seed=RANDOM_STATE,
             f.write(f"AIC: {AIC:.3f}\nBIC: {BIC:.3f}\nICL: {ICL:.3f}\nELBO: {fit['elbo']:.3f}\n")
 
     # Sélection du meilleur modèle selon AIC (comme recommandé dans l’article)
-    best = max(results, key=lambda d: d["AIC"])
+    best = max(results, key=lambda d: d[METRIC])
     best_Q = best["Q"]
 
     plt.figure(figsize=(6, 4))
@@ -1185,7 +1196,7 @@ def save_Pi_comparison(Pi_true, Pi_pred, outpath):
 
 def main():
     # --- 2. Sélection du sujet ---
-    SUBJECT_IDX = 3
+    
     A_filename = f"A_{SUBJECT_IDX:03d}.npy"     
     A_path = os.path.join(DATA_DIR, A_filename) 
 
