@@ -1,0 +1,9 @@
+{
+  "mode": "assortative",
+  "N": 150,
+  "Q": 8,
+  "beta": 0.9,
+  "eps": 0,
+  "zeta": 0.95,
+  "n_graphs": 1
+}

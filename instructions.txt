@@ -1,0 +1,38 @@
+Instructions pour exécuter différents modèles
+
+1 - deep_lpbm 
+
+Les graphs sont des fichiers dans "DATA_DIR". 
+Format .npy
+Le nom de chaque fichier commence par A_
+Dans le fichier il y a la matrice d'adjacence
+
+Pour processer le k-ème graphe dans DATA_DIR, il faut imposer la paramètre SUBJECT_IDX = k
+
+
+Sur les données avec Labels (synthetyques ou non) il calcule déjà ARI et NMI
+
+
+
+
+
+2 - SBM  (Stochastic block model)
+
+Pour plus d'info on peut regarder le fichier "exemple notebook"
+Mentionner    Funke T, Becker T (2019) Stochastic block models: A comparison of variants and inference methods. PLoS ONE 14(4): e0215296. https://doi.org/10.1371/journal.pone.0215296
+
+Faire import pysbm 
+
+Donné un graph dans format networkx, on cree un object appelé "standard partition", on définit une fonction objectif et on peut faire inference et appeler SBM
+
+
+
+standard_partition = pysbm.NxPartition(
+    graph=graph, 
+    number_of_blocks=2)
+
+standard_objective_function = pysbm.TraditionalUnnormalizedLogLikelyhood(is_directed=False)
+
+standard_inference = pysbm.MetropolisHastingInference(graph, standard_objective_function, standard_partition)
+
+standard_inference.infer_stochastic_block_model()
