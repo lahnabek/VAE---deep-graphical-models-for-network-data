@@ -1,4 +1,8 @@
-import numpy as np
+'''
+Contient la classe GCN. Nous avons préféré d'utilizer GCN Encoder mais on
+a la possibilité d'utiliser cette class dans deep_lpbm et on la tient en cas de nécéssité
+'''
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

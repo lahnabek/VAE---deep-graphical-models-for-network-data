@@ -1,3 +1,7 @@
+'''
+Contient la classe GCN Encoder, qui nous utilisons dans le fichier principal deep_lpbm
+'''
+
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv

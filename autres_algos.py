@@ -1,4 +1,7 @@
-#Contient tous les algorithmes de clustering utilisables
+'''
+Contient tous les algorithmes de clustering utiles pour faire l'evaluation de l'algorithme.
+Importante: il utilizes des bibliotèques différents du reste des fichiers
+'''
 
 import numpy as np
 

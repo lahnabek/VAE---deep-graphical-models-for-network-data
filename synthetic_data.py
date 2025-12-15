@@ -1,4 +1,7 @@
-# synthetic_data.py
+''''
+Creation des données synthetiques avec la fonction generate_synthetic
+'''
+
 import os
 import json
 import numpy as np
@@ -166,7 +169,7 @@ def generate_synthetic(outdir="data_synthetic",
         np.save(mode_dir / f"eta_{k:03d}.npy", eta_star)
 
         if draw:
-            from deep_lpbm_copy import draw_graph_hard_clusters, draw_graph_with_probabilities
+            from deep_lpbm import draw_graph_hard_clusters, draw_graph_with_probabilities
             draw_graph_hard_clusters(A, labels, results_dir=outdir+"/images", add_title=f'{zeta}')
             draw_graph_with_probabilities(A, eta_star, results_dir=outdir+"/images", add_title=f'{zeta}') 
         

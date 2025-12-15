@@ -1,3 +1,8 @@
+'''
+Contient la classe GCN Multi-Layers. On ne l'utilize pas dans le fichier principal
+mais on la tient en cas de nécéssité
+'''
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

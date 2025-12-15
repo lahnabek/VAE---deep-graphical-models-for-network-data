@@ -1,4 +1,9 @@
-# deep_lpbm_minimal.py
+'''
+Implementation de l'algorithme deepLPBM, qui est la fonction main().
+Main applique deep_LPBM à fichier numero SUBJECT_IDX dans le repertoire DATA_DIR
+MODE est outile seulement dans le cas de données synthetiques, on peut poser MODE="" sinon.
+Il sauvegarde tout résultat dans le repertoire "results+MODE"
+'''
 
 import os, json
 import glob
@@ -506,8 +511,6 @@ def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, 
     if class_labels is None:
         class_labels = [f"Class {i}" for i in range(k)]
 
-
-    print('col', class_colors, 'lab', class_labels)
 
     G = nx.from_numpy_array(A)
     pos = nx.spring_layout(G, seed=0)

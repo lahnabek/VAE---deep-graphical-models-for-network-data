@@ -1,25 +1,11 @@
-import os
-import glob
-
-import numpy as np
-import matplotlib.pyplot as plt
-
-import autres_algos as AA
-
-from deep_lpbm import main as run_deepLPBM
-from deep_lpbm import draw_graph_hard_clusters, draw_graph_with_probabilities
-from synthetic_data import generate_synthetic
+''''
+Algorithme d'évaluation. On controle l'algorithme à travers de la config au début du fichier
+Attention: il utilise autres_algos.py, donc il a besoin des bibliotèque supplementaires. 
+'''
 
 #-------------------------------------
 # CONFIG
 #-------------------------------------
-DATA_DIR = "data_numpy_synthetic"  #"dataset_numpy_spanningtree" #"miscdata" 
-ALL = False             # Évaluer tous les sujets dans DATA_DIR
-SUBJECT_IDX = 9         # Sujet à évaluer DANS DATA_DIR
-K = 3                    # Nombre de clusters (si applicable)
-results_dir = "Comparison"
-
-
 
 mode = "hub"   #"assortatve" "disassortative", "hub"
 N = 10 #nombre de nodes
@@ -34,8 +20,28 @@ SUBJECT_IDX = 0          # Sujet à évaluer DANS DATA_DIR
 results_dir = "Comparison_encore_hub"
 
 
-
+#si necessaire pour un experiment de comparaison
 sizes = [100, 150, 200, 250, 300, 350, 400]
+
+
+
+
+
+
+
+import os
+import glob
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+import autres_algos as AA
+
+from deep_lpbm import main as run_deepLPBM
+from deep_lpbm import draw_graph_hard_clusters, draw_graph_with_probabilities
+from synthetic_data import generate_synthetic
+
+
 
 
 
