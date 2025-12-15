@@ -1,35 +1,13 @@
 import os
 import glob
-import json
-
-import rpy2.robjects as ro
-import rpy2.robjects as ro
-from rpy2.robjects import numpy2ri
-from rpy2.robjects.conversion import localconverter
-from rpy2.robjects import default_converter
 
 import numpy as np
-import torch
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-from matplotlib.patches import Patch
-
-import igraph as ig
-import leidenalg
-import networkx as nx
-import graph_tool.all as gt
-from graph_tool.all import Graph, minimize_blockmodel_dl
-from sklearn.metrics import adjusted_rand_score as ARI
-from sklearn.cluster import SpectralClustering
-from graspologic.models import SBMEstimator
-import community as community_louvain
-from sklearn.mixture import GaussianMixture
-from graspologic.embed.ase import AdjacencySpectralEmbed
 
 import autres_algos as AA
 
-from deep_lpbm_copy import main as run_deepLPBM
-from deep_lpbm_copy import draw_graph_hard_clusters
+from deep_lpbm import main as run_deepLPBM
+from deep_lpbm import draw_graph_hard_clusters, draw_graph_with_probabilities
 from synthetic_data import generate_synthetic
 
 #-------------------------------------
@@ -40,6 +18,24 @@ ALL = False             # Évaluer tous les sujets dans DATA_DIR
 SUBJECT_IDX = 9         # Sujet à évaluer DANS DATA_DIR
 K = 3                    # Nombre de clusters (si applicable)
 results_dir = "Comparison"
+
+
+
+mode = "hub"   #"assortatve" "disassortative", "hub"
+N = 10 #nombre de nodes
+K = 5             #nombre de clusters
+beta = 0.7   #[0.5, 0.8]                   #grande probabiité de connection
+epsilon = 0   #[0, 0.2]              #petite probabilité de connextion
+zetas =  [0.9]  #[j/20 for j in range(12, 21) ]      #niveau de bruit
+outdir = "data_synthetic"
+DATA_DIR =  outdir + "/" + mode
+ALL = False             # Évaluer tous les sujets dans DATA_DIR
+SUBJECT_IDX = 0          # Sujet à évaluer DANS DATA_DIR
+results_dir = "Comparison_encore_hub"
+
+
+
+sizes = [100, 150, 200, 250, 300, 350, 400]
 
 
 
@@ -101,6 +97,8 @@ def evaluate_algorithm(A: np.array, result: dict, z_true=None, eta_true=None):
 
     metrics["K_est"] = K
     metrics["z"] = z
+    if "eta" in result: 
+        metrics["eta"] = result["eta"]
     return metrics
 
 
@@ -161,7 +159,7 @@ def run_experiment(A: np.array, z_true: list = None, eta_true: np.array = None, 
 
 
 
-def main(DATA_DIR=DATA_DIR, SUBJECT_IDX=SUBJECT_IDX, results_dir= results_dir ):
+def main(DATA_DIR=DATA_DIR, SUBJECT_IDX=SUBJECT_IDX, results_dir= results_dir , zeta=''):
     # --- 1. Load Files ---
     files = list_npy_graphs(DATA_DIR)
     assert len(files) > 0, f"Aucun fichier .npy trouvé dans {DATA_DIR}"
@@ -225,7 +223,11 @@ def main(DATA_DIR=DATA_DIR, SUBJECT_IDX=SUBJECT_IDX, results_dir= results_dir ):
         base_name = os.path.basename(A_path)
         current_id = int(base_name.split('_')[1].split('.')[0])
 
-        deeplpbm_res = run_deepLPBM(DATA_DIR=DATA_DIR, SUBJECT_IDX=real_idx, comparison=True, Q_true=eta_true.shape[1])
+
+        config_deeplpbm = {'DATA_DIR': DATA_DIR, 'SUBJECT_IDX': real_idx, 'Q_list': [eta_true.shape[1]]}
+
+
+        deeplpbm_res = run_deepLPBM(config_deeplpbm)
         results['deepLPBM'] = evaluate_algorithm(A, deeplpbm_res, y_true, eta_true)
 
         # D. Save Results & Update Return Variables
@@ -266,10 +268,11 @@ def main(DATA_DIR=DATA_DIR, SUBJECT_IDX=SUBJECT_IDX, results_dir= results_dir ):
             for algo_name, metrics in results.items():
                 if "z" in metrics:
                     safe_name = f"{base_name.replace('.npy','')}_{algo_name}"
-                    draw_graph_hard_clusters(A, metrics["z"], results_dir=img_path, algo=safe_name)
+                    draw_graph_hard_clusters(A, metrics["z"], results_dir=img_path, add_title=safe_name+f'{zeta}')
+                    if "eta" in metrics:
+                        draw_graph_with_probabilities(A, metrics["eta"], results_dir=img_path, add_title=safe_name+f'{zeta}')
 
     # print("Processing complete.")
-    
     return final_ARI, final_PME, final_NMI
 
 
@@ -279,12 +282,12 @@ def main(DATA_DIR=DATA_DIR, SUBJECT_IDX=SUBJECT_IDX, results_dir= results_dir ):
 
 
 algos = {
-    "SBM_Python": AA.run_graphtool_sbm,
+    "SBM": AA.run_graphtool_sbm,
     "Spectral_Clustering": AA.run_spectral_clustering,
     "Soft_Spectral_Clustering": AA.run_soft_spectral_clustering,
     "Louvain": AA.run_louvain,
-    "Leiden": AA.run_leiden,
-    "fake_VBLPCM_python": AA.run_vblpcm_python 
+    "Leiden": AA.run_leiden
+    #"fake_VBLPCM_python": AA.run_vblpcm_python 
     #"vblpcm_r": AA.run_vblpcm_r
 }
 #deep_LPBM est traité separement
@@ -292,26 +295,22 @@ algos = {
 
 
 
-mode = "assortative"   #"disassortative", "hub"
-
-N = 150 #nombre de nodes
-K = 4             #nombre de clusters
-beta = 0.8                   #grande probabiité de connection
-epsilon = 0.1                #petite probabilité de connextion
-zetas = [j/10 for j in range(6, 11) ]      #niveau de bruit
-
-
+mode = "hub"   #"assortatve" "disassortative", "hub"
+N = 50 #nombre de nodes
+K = 5             #nombre de clusters
+beta = 0.7   #[0.5, 0.8]                   #grande probabiité de connection
+epsilon = 0   #[0, 0.2]              #petite probabilité de connextion
+zetas =  [0.9]  #[j/20 for j in range(12, 21) ]      #niveau de bruit
 outdir = "data_synthetic"
 DATA_DIR =  outdir + "/" + mode
 ALL = False             # Évaluer tous les sujets dans DATA_DIR
 SUBJECT_IDX = 0          # Sujet à évaluer DANS DATA_DIR
-results_dir = "Comparison"
+results_dir = "Comparison_encore_hub"
 
-
+sizes = [100, 150, 200, 250, 300, 350, 400]
 
 
 def comparison_experiment():
-
 
     total_ARI = {algo: [] for algo in algos.keys()}
     total_ARI['deepLPBM'] = []
@@ -333,19 +332,34 @@ def comparison_experiment():
                        beta=beta,
                        eps=epsilon,
                        zeta=zetas[x], # 1 for hard clustering and in (0,1) for partial
-                       seed=0)
+                       seed=0, 
+                       generalized=False, 
+                       draw = True)
     
-        partial_ARI, partial_PME, partial_NMI = main(DATA_DIR=DATA_DIR, 
+
+        partial_ARI, partial_NMI, partial_PME = {}, {}, {}
+
+        for algo in algos:
+            partial_ARI[algo], partial_NMI[algo], partial_PME[algo] = 0, 0, 0
+        partial_ARI['deepLPBM'], partial_NMI['deepLPBM'], partial_PME['deepLPBM']=0, 0, 0
+
+        for i in range(10):        
+            pp_ARI, pp_PME, pp_NMI = main(DATA_DIR=DATA_DIR, 
                                         SUBJECT_IDX=SUBJECT_IDX,
-                                        results_dir=None)
-        print('ari', partial_ARI, 'pme', partial_PME, 'nmi', partial_NMI)
+                                        results_dir=results_dir, zeta=zetas[x])
+            for algo in pp_ARI.keys(): 
+                partial_ARI[algo] += pp_ARI[algo]/10
+                partial_NMI[algo] += pp_PME[algo]/10
+                partial_PME[algo] += pp_NMI[algo]/10
+            
+
+
 
         for algo in partial_ARI.keys():
             print('algo update', algo)
             total_ARI[algo].append(partial_ARI[algo])
             total_PME[algo].append(partial_PME[algo])
             total_NMI[algo].append(partial_NMI[algo])
-        print('total_ari', total_ARI)
 
 
 
@@ -400,6 +414,135 @@ def comparison_experiment():
     plt.grid(True, alpha=0.3)
     if results_dir:
         plt.savefig(os.path.join(results_dir, "ARI_comparison.png"), dpi=300)
+    #plt.show()
+    plt.close() 
+
+
+    # PME Plot
+    plt.figure(figsize=(10, 6))
+    plt.xlabel("Zeta (Hardness of Clustering)")
+    plt.ylabel("PME (H-Score Error)")
+    plt.title("Partial Membership Estimation Error")
+    
+    for algo, scores in total_PME.items():
+        plt.plot(zetas, scores, marker='s', linestyle='--', label=algo)
+        
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    if results_dir:
+        plt.savefig(os.path.join(results_dir, "PME_comparison.png"), dpi=300)
+    #plt.show()
+    plt.close()
+
+
+    #ARI Plot
+    plt.figure(figsize=(10, 6))
+    plt.xlabel("Zeta (Hardness of Clustering)")
+    plt.ylabel("NMI (Normalised Mutual Information)")
+    plt.title("Clustering Performance vs. Mixing Parameter")
+    
+    for algo, scores in total_ARI.items():
+        plt.plot(zetas, scores, marker='o', label=algo)
+        
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    if results_dir:
+        plt.savefig(os.path.join(results_dir, "NMI_comparison.png"), dpi=300)
+    #plt.show()
+    plt.close() 
+
+
+
+
+
+
+def size_comparison_experiment():
+
+    print(results_dir)
+
+
+    total_ARI = {algo: [] for algo in algos.keys()}
+    total_ARI['deepLPBM'] = []
+    
+    total_PME = {algo: [] for algo in algos.keys()}
+    total_PME['deepLPBM'] = []
+
+    total_NMI = {algo: [] for algo in algos.keys()}
+    total_NMI['deepLPBM'] = []
+
+
+    for x in range(len(sizes)):
+        print(f"\n--- Running Experiment for Zeta = {sizes[x]} ---")
+        generate_synthetic(mode=mode, #disassortative, hub, disassortative
+                       outdir=outdir,
+                       n_graphs=1,
+                       N=sizes[x],
+                       Q=K,
+                       beta=beta,
+                       eps=epsilon,
+                       zeta=0.1, # 1 for hard clustering and in (0,1) for partial
+                       seed=0, 
+                       generalized=False)   
+        partial_ARI, partial_PME, partial_NMI = main(DATA_DIR=DATA_DIR, 
+                                        SUBJECT_IDX=SUBJECT_IDX,
+                                        results_dir=None)
+
+        for algo in partial_ARI.keys():
+            total_ARI[algo].append(partial_ARI[algo])
+            total_PME[algo].append(partial_PME[algo])
+            total_NMI[algo].append(partial_NMI[algo])
+
+
+
+    if results_dir is not None:
+        os.makedirs(results_dir, exist_ok=True)
+        ari_path = os.path.join(results_dir, "total_ARI.txt")
+        pme_path = os.path.join(results_dir, "total_partial_membership_evaluation.txt")
+        nmi_path = os.path.join(results_dir, "total_NMI.txt")
+        img_path = os.path.join(results_dir, "images")
+        os.makedirs(img_path, exist_ok=True)
+
+        with open(ari_path, 'w') as f: 
+                # Header: Zeta, Algo1, Algo2, ...
+                header = "N," + ",".join(total_ARI.keys()) + "\n"
+                f.write(header)
+            
+                # Rows
+                for i, z_val in enumerate(sizes):
+                    row_vals = [f"{total_ARI[algo][i]:.4f}" for algo in total_ARI.keys()]
+                    f.write(f"{z_val}," + ",".join(row_vals) + "\n")
+
+        with open(pme_path, 'w') as f:
+            header = "N," + ",".join(total_PME.keys()) + "\n"
+            f.write(header)
+            
+            for i, z_val in enumerate(sizes):
+                row_vals = [f"{total_PME[algo][i]:.4f}" for algo in total_PME.keys()]
+                f.write(f"{z_val}," + ",".join(row_vals) + "\n")
+
+        with open(nmi_path, 'w') as f: 
+                # Header: Zeta, Algo1, Algo2, ...
+                header = "N," + ",".join(total_NMI.keys()) + "\n"
+                f.write(header)
+            
+                # Rows
+                for i, z_val in enumerate(sizes):
+                    row_vals = [f"{total_NMI[algo][i]:.4f}" for algo in total_NMI.keys()]
+                    f.write(f"{z_val}," + ",".join(row_vals) + "\n")
+
+    #ARI Plot
+    plt.figure(figsize=(10, 6))
+    plt.xlabel("Zeta (Hardness of Clustering)")
+    plt.ylabel("ARI (Adjusted Rand Index)")
+    plt.title("Clustering Performance vs. Mixing Parameter")
+    
+    for algo, scores in total_ARI.items():
+        plt.plot(sizes, scores, marker='o', label=algo)
+        
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    if results_dir:
+        plt.savefig(os.path.join(results_dir, "ARI_comparison.png"), dpi=300)
     plt.show()
     plt.close() 
 
@@ -423,6 +566,7 @@ def comparison_experiment():
 
     #ARI Plot
     plt.figure(figsize=(10, 6))
+
     plt.xlabel("Zeta (Hardness of Clustering)")
     plt.ylabel("NMI (Normalised Mutual Information)")
     plt.title("Clustering Performance vs. Mixing Parameter")
@@ -442,6 +586,7 @@ def comparison_experiment():
 
 if __name__ == "__main__":
     comparison_experiment()
+
 
 
 

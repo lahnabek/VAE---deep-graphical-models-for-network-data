@@ -1,6 +1,14 @@
 # deep_lpbm_minimal.py
 
 import os, json
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["TORCH_NUM_THREADS"] = "1"
+
+from joblib import Parallel, delayed
+
+
 import glob
 import numpy as np
 import pandas as pd
@@ -18,8 +26,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Wedge, Patch
 import matplotlib.colors as mcolors
 
-
-
+from sklearn.decomposition import TruncatedSVD
 
 from class_GCN import *
 from class_GCNEncoder import *
@@ -29,7 +36,7 @@ from class_GCN_Multi_layers import *
 # ---------------------------------------------------------------------
 MODE = "assortative" # disassortative, assortative, hub
 DATA_DIR = "data_synthetic/" + MODE  # "miscdata" 
-SUBJECT_IDX = 1
+SUBJECT_IDX = 0
 RANDOM_STATE = 42
 HIDDEN_LAYERS_GCN = [ 32]
 SPLITLAYER = False
@@ -136,7 +143,7 @@ def init_all_params_dur(A, Q, params, eps=1e-5):
 
     return eta0, z0, Pi0, Pi_tilde0
 
-def init_all_params(A, Q, params, eps=1e-6, tau=1e-16):
+def init_all_params_bad(A, Q, params, eps=1e-6, tau=1e-16):
     # tester : prior dirichlet sur eta
     """
     Initialise TOUT pour Deep LPBM (VERSION DOUCE, type ancien code):
@@ -222,6 +229,72 @@ def init_all_params(A, Q, params, eps=1e-6, tau=1e-16):
     params["z0"]         = z0
     params["Pi0"]        = Pi0
     params["Pi_tilde0"]  = Pi_tilde0
+
+    return eta0, z0, Pi0, Pi_tilde0
+
+
+def init_all_params(A, Q, params, eps=1e-6):
+    """
+    Robust initialization using Spectral Embedding + Softening.
+    """
+    device = torch.device(params.get("device", "cpu"))
+    N = A.shape[0]
+    A_t = torch.tensor(A, dtype=torch.float32, device=device)
+
+    # 1) Spectral Initialization (Robust to sparsity)
+    #    We use SVD on A to find the "true" blocks even if edges are missing.
+    svd = TruncatedSVD(n_components=min(Q, N - 1), n_iter=10, random_state=42)
+    U = svd.fit_transform(A)
+    
+    # 2) KMeans on the embeddings
+    km = KMeans(n_clusters=Q, n_init=10, random_state=42).fit(U)
+    labels = torch.from_numpy(km.labels_.astype(int)).to(device)
+
+    # 3) Soft One-Hot Encoding
+    #    CRITICAL FIX: We use a high temperature (softness) to keep logits small.
+    #    Instead of 0/1, we want approx 0.2/0.8. This keeps z0 around [-1.5, 1.5].
+    #    This prevents the KL term from crushing the model at epoch 0.
+    softness = 0.2  # 20% uncertainty
+    eta0 = F.one_hot(labels, num_classes=Q).float()
+    eta0 = eta0 * (1 - softness) + (softness / Q)  # Smooth distribution
+    eta0 = eta0 / eta0.sum(dim=1, keepdim=True)
+
+    # 4) Calculate z0 (Inverse Softmax)
+    #    Since eta0 is safe/smooth, z0 will not explode.
+    denom = eta0[:, [Q-1]]
+    numer = eta0[:, :Q-1]
+    z0 = torch.log(numer) - torch.log(denom)
+    
+    # 5) Estimate Pi0 (Block Connectivity)
+    #    Standard calculation based on the initial clusters
+    Pi0_num = torch.zeros((Q, Q), device=device)
+    Pi0_den = torch.zeros((Q, Q), device=device)
+    upper_mask = torch.triu(torch.ones(N, N, device=device), diagonal=1)
+
+    for q in range(Q):
+        eta_q = eta0[:, q].unsqueeze(1)
+        for r in range(Q):
+            eta_r = eta0[:, r].unsqueeze(0)
+            eta_outer = eta_q @ eta_r
+            # Weighted sum of edges
+            num = (A_t * eta_outer * upper_mask).sum()
+            den = (eta_outer * upper_mask).sum()
+            Pi0_num[q, r] = num
+            Pi0_den[q, r] = den + eps
+
+    Pi0 = Pi0_num / Pi0_den
+    Pi0 = 0.5 * (Pi0 + Pi0.T)
+    Pi0 = Pi0.clamp(0.01, 0.99)
+
+    # 6) Unconstrained Parameter for Pi
+    Pi_tilde0 = torch.tan(np.pi * (Pi0 - 0.5))
+    Pi_tilde0 = nn.Parameter(Pi_tilde0)
+
+    # Store
+    params["eta0"]      = eta0
+    params["z0"]        = z0
+    params["Pi0"]       = Pi0
+    params["Pi_tilde0"] = Pi_tilde0
 
     return eta0, z0, Pi0, Pi_tilde0
 
@@ -550,7 +623,7 @@ def save_all_figures(results_dir, best, Q):
     plot_eta_histogram(best["eta"], Q, results_dir)
 
 
-def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, node_radius=None, results_dir=None):
+def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, node_radius=None, results_dir=None, add_title=""):
     """
     A : (n,n) 
     eta : (n,k) 
@@ -559,8 +632,10 @@ def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, 
     """
     n, k = eta.shape
 
+    os.makedirs(results_dir, exist_ok=True)
+
     if not node_radius:
-        node_radius = 1.5/n
+        node_radius = 4.5/n
 
 
     if not class_colors:
@@ -578,7 +653,7 @@ def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, 
     pos = nx.spring_layout(G, seed=0)
 
     fig, ax = plt.subplots(figsize=(8,8))
-    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.4)
+    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.4, edge_color='grey')
     
     for i, (x, y) in pos.items():
         start_angle = 90
@@ -602,8 +677,8 @@ def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, 
         circ = plt.Circle((x, y), node_radius, fill=False, edgecolor='black', lw=0.3)
         ax.add_patch(circ)
 
-    legend_patches = [Patch(facecolor=c, edgecolor='black', label=label) for c, label in zip(class_colors, class_labels)]
-    ax.legend(handles=legend_patches, loc='upper right', bbox_to_anchor=(1.15, 1))
+    #legend_patches = [Patch(facecolor=c, edgecolor='black', label=label) for c, label in zip(class_colors, class_labels)]
+    #ax.legend(handles=legend_patches, loc='upper right', bbox_to_anchor=(1.15, 1))
     
 
     
@@ -625,20 +700,22 @@ def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, 
     ax.autoscale()     
 
     if results_dir is not None:
-        plt.savefig(os.path.join(results_dir, "soft_classification.png"), bbox_inches='tight', dpi=300)
+        plt.savefig(os.path.join(results_dir, add_title + "soft_classification.png"), bbox_inches='tight', dpi=300)
     
-    plt.show()
+    #plt.show()
     plt.close()
 
 
 
-def draw_graph_hard_clusters(A, y, class_colors=None, class_labels=None, node_size=None, results_dir=None):
+def draw_graph_hard_clusters(A, y, class_colors=None, class_labels=None, node_size=None, results_dir=None, add_title=""):
     """
     A : (n,n) 
     y : (n,k) 
     class_colors : coleurs, facultatives
     node_size : taille des nodes
     """
+    os.makedirs(results_dir, exist_ok = True)
+
     n = len(y)
     k = int(np.max(y))
 
@@ -663,7 +740,7 @@ def draw_graph_hard_clusters(A, y, class_colors=None, class_labels=None, node_si
     pos = nx.spring_layout(G, seed=0)
 
     fig, ax = plt.subplots(figsize=(8,8))
-    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.4)
+    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.4,edge_color='grey')
     nx.draw_networkx_nodes(G, pos,
                            node_color=node_colors,
                            node_size=node_size,
@@ -678,8 +755,8 @@ def draw_graph_hard_clusters(A, y, class_colors=None, class_labels=None, node_si
 
 
 
-    legend_patches = [Patch(facecolor=c, edgecolor='black', label=label) for c, label in zip(class_colors, class_labels)]
-    ax.legend(handles=legend_patches, loc='upper right', bbox_to_anchor=(1.15, 1))
+    #legend_patches = [Patch(facecolor=c, edgecolor='black', label=label) for c, label in zip(class_colors, class_labels)]
+    #ax.legend(handles=legend_patches, loc='upper right', bbox_to_anchor=(1.15, 1))
 
     
     ax.set_aspect('equal')
@@ -687,9 +764,9 @@ def draw_graph_hard_clusters(A, y, class_colors=None, class_labels=None, node_si
 
 
     if results_dir is not None:
-        plt.savefig(os.path.join(results_dir, "hard_clusters.png"), bbox_inches='tight', dpi=300)
+        plt.savefig(os.path.join(results_dir, add_title + "hard_clusters.png"), bbox_inches='tight', dpi=300)
     
-    plt.show()
+    #plt.show()
     plt.close()
 
 
@@ -703,7 +780,7 @@ def draw_graph_hard_clusters(A, y, class_colors=None, class_labels=None, node_si
 # ---------------------------------------------------------------------
 
 
-def elbo_stub(A, P, mu, logvar):
+def elbo_stub_bad(A, P, mu, logvar):
     ij = np.triu_indices(A.shape[0], 1)
     ll = (A[ij] * torch.log(P[ij]) + (1-A[ij]) * torch.log(1-P[ij])).sum()
 
@@ -713,6 +790,24 @@ def elbo_stub(A, P, mu, logvar):
 
     return ll - kl
 
+
+def elbo_stub(A, P, mu, logvar):
+    """
+    Numerically stable ELBO calculation using Binary Cross Entropy.
+    """
+    # 1. Reconstruction Loss (maximize log-likelihood => minimize BCE)
+    #    We compute BCE on the full matrix and divide by 2 to respect undirected nature.
+    #    (This avoids the slow np.triu_indices on GPU tensors)
+    recon_loss = F.binary_cross_entropy(P, A, reduction='sum') / 2.0
+    
+    # 2. KL Divergence
+    #    Analytical KL between N(mu, sigma) and N(0, 1)
+    #    sum over all nodes (N) and dimensions (Q-1)
+    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+    # ELBO = Expected Log Likelihood - KL
+    # Since we use loss (minimize), Loss = -ELBO = Recon + KL
+    return   -recon_loss - kl_loss 
 
 
 # ---------------------------------------------------------------------
@@ -933,6 +1028,42 @@ def collapse_small_clusters(eta, min_size_ratio=0.03):
     return eta_new
 
 
+def partial_Q(A, Q, subject_name="", seed=RANDOM_STATE, CLASS_GCN = CLASS_GCN):
+        
+        results_dir_base = os.path.join("results", subject_name)
+        os.makedirs(results_dir_base, exist_ok=True)
+
+
+        print(f"\n=== Entraînement pour Q = {Q} ===")
+        results_dir_Q = os.path.join(results_dir_base, f"Q_{Q}")
+        if CLASS_GCN == "GCN":
+            fit = train_deep_lpbm_GCN(A, Q, seed=seed, results_dir=results_dir_Q)
+        if CLASS_GCN == "GCNEncoder":
+            fit = train_deep_lpbm_GCNEncoder(A, Q, seed=seed, results_dir=results_dir_Q)
+        
+        # collapse éventuel des petits clusters
+        eta_collapsed = collapse_small_clusters(fit["eta"], min_size_ratio=0.03)
+        fit["eta"] = eta_collapsed
+
+        # recalcul des critères d'information
+        AIC, BIC, ICL = compute_AIC_BIC_ICL(A, fit["eta"], fit["Pi"])
+        fit.update({"Q": Q, "AIC": AIC, "BIC": BIC, "ICL": ICL})
+
+        draw_graph_with_probabilities(A, fit["eta"], results_dir=results_dir_Q)
+
+        y_hat = fit["eta"].argmax(axis=1)
+        draw_graph_hard_clusters(A, y_hat, results_dir=results_dir_Q)
+
+
+        # Sauvegarde rapide des scores numériques
+        with open(os.path.join(results_dir_Q, "scores.txt"), "w") as f:
+            f.write(f"AIC: {AIC:.3f}\nBIC: {BIC:.3f}\nICL: {ICL:.3f}\nELBO: {fit['elbo']:.3f}\n")
+
+        return fit, AIC
+
+
+
+
 def model_selection_over_Q(A, Q_list, subject_name="subject", seed=RANDOM_STATE, CLASS_GCN = CLASS_GCN):
     """
     Essaie plusieurs valeurs de Q et renvoie le meilleur modèle selon l'AIC.
@@ -943,6 +1074,9 @@ def model_selection_over_Q(A, Q_list, subject_name="subject", seed=RANDOM_STATE,
 
     results = []
     AIC_log = []
+
+    results = []
+    
     for Q in Q_list:
         print(f"\n=== Entraînement pour Q = {Q} ===")
         results_dir_Q = os.path.join(results_dir_base, f"Q_{Q}")
@@ -960,16 +1094,18 @@ def model_selection_over_Q(A, Q_list, subject_name="subject", seed=RANDOM_STATE,
         AIC_log.append(AIC)
         fit.update({"Q": Q, "AIC": AIC, "BIC": BIC, "ICL": ICL})
         results.append(fit)
-
-        #draw_graph_with_probabilities(A, fit["eta"], results_dir=results_dir_Q)
+        draw_graph_with_probabilities(A, fit["eta"], results_dir=results_dir_Q)
 
         y_hat = fit["eta"].argmax(axis=1)
-        #draw_graph_hard_clusters(A, y_hat, results_dir=results_dir_Q)
+        draw_graph_hard_clusters(A, y_hat, results_dir=results_dir_Q)
 
 
         # Sauvegarde rapide des scores numériques
         with open(os.path.join(results_dir_Q, "scores.txt"), "w") as f:
             f.write(f"AIC: {AIC:.3f}\nBIC: {BIC:.3f}\nICL: {ICL:.3f}\nELBO: {fit['elbo']:.3f}\n")
+
+        return fit, AIC
+
 
     # Sélection du meilleur modèle selon AIC (comme recommandé dans l’article)
     best = max(results, key=lambda d: d[METRIC])
@@ -1221,6 +1357,7 @@ def main(DATA_DIR: str = DATA_DIR, SUBJECT_IDX: int = SUBJECT_IDX, comparison: b
     if Q_true is None: 
         Q_list = [3, 4, 5, 6]
     else: Q_list = [Q_true]
+
     best, all_results = model_selection_over_Q(A, Q_list, subject_name=MODE + subject_name)
 
     # --- 4. Résumé du meilleur modèle ---

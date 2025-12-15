@@ -1,66 +1,17 @@
 #Contient tous les algorithmes de clustering utilisables
 
-
-import os
-import glob
-import json
-
-import rpy2.robjects as ro
-from rpy2.robjects import numpy2ri
-from rpy2.robjects.conversion import localconverter
-from rpy2.robjects import default_converter
-
 import numpy as np
-import torch
-import matplotlib.pyplot as plt
-
-import matplotlib.colors as mcolors
-from matplotlib.patches import Patch
 
 import igraph as ig
 import leidenalg
 import networkx as nx
 import graph_tool.all as gt
-from graph_tool.all import Graph, minimize_blockmodel_dl
+
 from sklearn.cluster import SpectralClustering
-from sklearn.metrics import adjusted_rand_score as ARI
-from graspologic.models import SBMEstimator
-from graspologic.embed.ase import AdjacencySpectralEmbed
-from sklearn.mixture import GaussianMixture
+
 from sklearn.manifold import spectral_embedding
 from sklearn.cluster import KMeans
 
-
-
-#---------------------
-#Choses pour R
-#----------------------
-
-import rpy2.robjects.packages as rpackages
-from rpy2.robjects.vectors import StrVector
-
-def install_r_dependencies():
-    """Installs required R packages for VBLPCM."""
-    # Import R's utility package
-    utils = rpackages.importr('utils')
-    
-    # Select the first CRAN mirror to avoid interactive popups
-    utils.chooseCRANmirror(ind=1)
-    
-    # Packages to install
-    needed_packs = ['vblpcm', 'network', 'sna']
-    
-    # Check which are missing
-    missing_packs = [x for x in needed_packs if not rpackages.isinstalled(x)]
-    
-    if missing_packs:
-        print(f"Installing missing R packages: {missing_packs}...")
-        utils.install_packages(StrVector(missing_packs))
-    else:
-        print("All R packages are already installed.")
-
-# Run the installation
-install_r_dependencies()
 
 
 #--------------------------------------------
@@ -235,111 +186,6 @@ def run_leiden(A, K=None):
     
     B = compute_block_density(A, z, K)
     return {"z": z, "K": K, "B": B}
-
-
-
-
-#VBLPCM avec Python
-
-
-def run_vblpcm_python(A, max_k=10, K=None):
-    # 1. Embed (ASE)
-    ase = AdjacencySpectralEmbed(n_components=None) 
-    X = ase.fit_transform(A)
-    if isinstance(X, tuple):
-        X = np.concatenate(X, axis=1)
-
-    # 2. GMM with BIC selection
-    best_gmm = None
-    lowest_bic = np.inf 
-    
-    # Limit max_k to N/2 to avoid errors on small graphs
-    limit_k = min(max_k, A.shape[0] // 2)
-    
-    for k in range(1, limit_k + 1):
-        try:
-            gmm = GaussianMixture(n_components=k, covariance_type='full', random_state=42)
-            gmm.fit(X)
-            bic = gmm.bic(X)
-            if bic < lowest_bic:
-                lowest_bic = bic
-                best_gmm = gmm
-        except Exception:
-            continue
-            
-    if best_gmm is None:
-        z = np.zeros(A.shape[0], dtype=int)
-        eta = np.ones((A.shape[0], 1)) # Trivial soft assignment
-        K = 1
-    else:
-        z = best_gmm.predict(X)
-        K = best_gmm.n_components
-        eta = best_gmm.predict_proba(X)
-    
-    return {"z": z, "K": K, "eta": eta}
-
-
-
-#VBLPCM avec R, faire gaffe peut etre qu'il est très lent
-
-
-def run_vblpcm_r(A, max_k=5, K=None):
-    """
-    Robust R implementation. 
-    Assumes install_r_dependencies() has been run.
-    """
-    is_directed = not np.allclose(A, A.T)
-    r_directed = "TRUE" if is_directed else "FALSE"
-
-    # Activate numpy converter
-    with localconverter(default_converter + numpy2ri.converter):
-        ro.globalenv["A"] = A
-        
-        # Robust R script
-        r_script = f"""
-        library(vblpcm)
-        library(network)
-        
-        # Suppress warnings for cleaner output
-        suppressWarnings({{
-            net <- network(as.matrix(A), directed={r_directed})
-            
-            best_bic <- -Inf
-            best_z <- rep(1, network.size(net)) # Default fallback
-            
-            # Search G from 1 to {max_k}
-            for (g in 1:{max_k}) {{
-                tryCatch({{
-                    v_start <- vblpcmstart(net, G=g, plot=FALSE, verbosity=0)
-                    v_fit <- vblpcmfit(v_start, STEPS=20, plotting=FALSE) # Lower STEPS for speed
-                    
-                    if (!is.nan(v_fit$BIC) && v_fit$BIC > best_bic) {{
-                        best_bic <- v_fit$BIC
-                        # Extract hard assignments from probabilities
-                        best_z <- apply(v_fit$Y, 1, which.max)
-                    }}
-                }}, error=function(e){{ NULL }})
-            }}
-        }})
-        best_z
-        """
-        
-        try:
-            # Execute R code and get result
-            z_r = ro.r(r_script)
-            z_raw = np.array(z_r, dtype=int)
-            z = z_raw - 1 # R is 1-indexed
-        except Exception as e:
-            print(f"R VBLPCM Error: {e}")
-            # Fallback
-            z = np.zeros(A.shape[0], dtype=int)
-
-    K = len(np.unique(z))
-    B = compute_block_density(A, z, K)
-    
-    return {"z": z, "K": K, "B": B}
-
-
 
 
 

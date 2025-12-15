@@ -1,0 +1,2 @@
+Zeta,SBM,Spectral_Clustering,Soft_Spectral_Clustering,Louvain,Leiden,deepLPBM
+0.9,0.4393,0.8383,0.8383,0.6156,0.6156,0.1494

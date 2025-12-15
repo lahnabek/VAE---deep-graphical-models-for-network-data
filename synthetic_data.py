@@ -35,6 +35,41 @@ def _build_connectivity_matrix(mode, Q, beta, eps):
     return Pi
 
 
+def sample_range(range):
+    X = np.random.rand()
+    return range[0]+X*(range[1]-range[0])
+
+def _build_generalised_connectivity_matrix(mode, Q, beta_range, eps_range):
+    """Construit Π selon les 3 structures de l’article (communities, disassortative, hub)."""
+
+    Pi = np.zeros((Q, Q))
+
+    if mode == "assortative":
+        for i in range(Q):
+            for j in range(Q):
+                Pi[i, j] = sample_range(beta_range) if i == j else sample_range(eps_range)
+
+    elif mode == "disassortative":
+        for i in range(Q):
+            for j in range(Q):
+                Pi[i, j] = sample_range(eps_range) if i == j else sample_range(beta_range)
+
+    elif mode == "hub":
+        Pi[:] = sample_range(eps_range)
+        hub_cluster = 0                           # cluster choisi comme hub
+        Pi[hub_cluster, :] = sample_range(beta_range)
+        Pi[:, hub_cluster] = sample_range(beta_range)
+        for q in range(1, Q):
+            Pi[q, q] = sample_range(beta_range)                     # les autres restent "communities-like"
+    else:
+        raise ValueError(f"Unknown mode {mode}")
+
+    # assure symétrie
+    Pi = 0.5 * (Pi + Pi.T)
+    return Pi
+
+
+
 def _build_partial_memberships(N, Q, zeta):
     """Construit η⋆ = ζ·onehot + (1-ζ)·uniform comme dans la section 5.1."""
     q_per_block = N // Q
@@ -73,7 +108,9 @@ def generate_synthetic(outdir="data_synthetic",
                        beta=0.3,
                        eps=0.05,
                        zeta=1.0,
-                       seed=0):
+                       seed=0, 
+                       generalized = False, 
+                       draw = False):  #Si generalized=True, beta et eps doivent etre des listes [a, b]
     """
     Génère des données synthétiques à la Deep LPBM :
     - Matrice Π (Q×Q)
@@ -101,11 +138,17 @@ def generate_synthetic(outdir="data_synthetic",
         "n_graphs": n_graphs
     }
 
+    print('beta', beta, 'eps', eps)
+
     # --- génération de n_graphs
     for k in range(n_graphs):
 
         # Connectivité Π
-        Pi = _build_connectivity_matrix(mode, Q, beta, eps)
+
+        if generalized: 
+            Pi = _build_generalised_connectivity_matrix(mode, Q, beta, eps)
+        else: 
+            Pi = _build_connectivity_matrix(mode, Q, beta, eps)
 
         # Membres η⋆
         eta_star, labels = _build_partial_memberships(N, Q, zeta)
@@ -122,20 +165,27 @@ def generate_synthetic(outdir="data_synthetic",
         np.save(mode_dir / f"Pi_{k:03d}.npy", Pi)
         np.save(mode_dir / f"eta_{k:03d}.npy", eta_star)
 
+        if draw:
+            from deep_lpbm_copy import draw_graph_hard_clusters, draw_graph_with_probabilities
+            draw_graph_hard_clusters(A, labels, results_dir=outdir+"/images", add_title=f'{zeta}')
+            draw_graph_with_probabilities(A, eta_star, results_dir=outdir+"/images", add_title=f'{zeta}') 
+        
     with open(mode_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
     return str(mode_dir)
 
 
+
+
 if __name__ == "__main__":
     # Exemple : générer 10 graphes disassortatifs
     generate_synthetic(mode="assortative", #disassortative, hub, disassortative
                        outdir="data_synthetic",
-                       n_graphs=10,
-                       N=30,
+                       n_graphs=1,
+                       N=50,
                        Q=5,
-                       beta=0.7,
-                       eps=0.05,
-                       zeta=1.0, # 1 for hard clustering and in (0,1) for partial
+                       beta=0.9,
+                       eps=0.1,
+                       zeta=0.8, # 1 for hard clustering and in (0,1) for partial
                        seed=0)

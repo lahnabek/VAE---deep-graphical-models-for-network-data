@@ -14,10 +14,11 @@ from sklearn.metrics import confusion_matrix, adjusted_rand_score, normalized_mu
 from torch_geometric.utils import dense_to_sparse
 import seaborn as sns
 import networkx as nx
+
+
 import matplotlib.pyplot as plt
 from matplotlib.patches import Wedge, Patch
 import matplotlib.colors as mcolors
-
 
 
 
@@ -27,6 +28,8 @@ from class_GCN_Multi_layers import *
 # ---------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------
+
+
 MODE = "assortative" # disassortative, assortative, hub
 DATA_DIR = "data_synthetic/" + MODE# "miscdata" 
 RANDOM_STATE = 42
@@ -37,8 +40,27 @@ MAX_EPOCHS = 600          # Phase estimation (Algorithme 1)
 LEARNING_RATE = 1e-2   # Adam lr=0.01 dans l'article
 NUM_SEEDS = 5            # on garde le meilleur ELBO
 CLASS_GCN = "GCNEncoder"  #  "GCNEncoder" , 
-SUBJECT_IDX = 1
+SUBJECT_IDX = 0
 METRIC = "AIC" # AIC, BIC, ICL
+Q_list = [3, 4, 5, 6, 7]
+
+config_zero = {
+    'MODE' : MODE, # disassortative, assortative, hub
+    'DATA_DIR' : DATA_DIR, # "miscdata" 
+    'RANDOM_STATE' : RANDOM_STATE,
+    'HIDDEN_LAYERS_GCN' : HIDDEN_LAYERS_GCN, 
+    'SPLITLAYER' : SPLITLAYER,
+    'MAX_EPOCHS_INIT' : MAX_EPOCHS_INIT,     # Phase init encodeur (Algorithme 1)
+    'MAX_EPOCHS' :MAX_EPOCHS,          # Phase estimation (Algorithme 1)
+    'LEARNING_RATE' : LEARNING_RATE,   # Adam lr=0.01 dans l'article
+    'NUM_SEEDS' : NUM_SEEDS,           # on garde le meilleur ELBO
+    'CLASS_GCN' : CLASS_GCN,  #  "GCNEncoder" , 
+    'SUBJECT_IDX' : SUBJECT_IDX,
+    'METRIC' : "AIC",
+    'Q_list' : Q_list      }# AIC, BIC, ICL 
+
+
+
 
 """
 ancienne config GCN 2 couches de l'article, marche bien sur Q=3 mais pas au dela:
@@ -49,95 +71,8 @@ SPLITLAYER = False
 # UTILS
 # ---------------------------------------------------------------------
 
-def init_all_params_dur(A, Q, params, eps=1e-5):
-    """
-    Initialise TOUT pour Deep LPBM :
-      - eta0       : N×Q appartenance douce issue de KMeans (adoucie, stable)
-      - z0         : N×(Q-1) logits initiaux (inverse softmax centré stable)
-      - Pi0        : Q×Q estimation initiale des probabilités de blocs
-      - Pi_tilde0  : Q×Q paramètre non borné (nn.Parameter) pour optimiser Π
-
-    Tout est créé directement sur device, et stocké directement dans params.
-    """
-
-    device = torch.device(params.get("device", "cpu"))
-    N = A.shape[0]
-
-    A_t = torch.tensor(A, dtype=torch.float32, device=device)
-
-    # ===========================
-    # 1) KMEANS → labels
-    # ===========================
-    km = KMeans(n_clusters=Q, n_init="auto", random_state=0).fit(A)
-    labels = torch.from_numpy(km.labels_.astype(int)).to(device)
-
-    # ===========================
-    # 2) One-hot + adouci (évite extrêmes)
-    # ===========================
-    c = F.one_hot(labels, num_classes=Q).float().to(device)
-
-    epsi = eps
-
-    # eta0 doux : jamais 1, jamais 0
-    eta0 = torch.full_like(c, epsi)
-    eta0[c > 0.9] = 1.0 - (Q - 1) * epsi
-    eta0 = eta0 / eta0.sum(dim=1, keepdim=True)  # normalisation simplex
-
-    # ===========================
-    # 3) z0 = inverse softmax centré
-    # ===========================
-    eta_Q = eta0[:, -1:].clamp_min(epsi)
-    z0 = torch.log(eta0[:, :-1].clamp_min(epsi)) - torch.log(eta_Q)
-
-    # stabilisation : pas de z trop grand
-    z0 = torch.clamp(z0, -10.0, 10.0)
-
-    # ===========================
-    # 4) Estimation stable de Pi0
-    # ===========================
-    Pi0_num = torch.zeros((Q, Q), device=device)
-    Pi0_den = torch.zeros((Q, Q), device=device)
-    upper_mask = torch.triu(torch.ones(N, N, device=device), diagonal=1)
-
-    for q in range(Q):
-        eta_q = eta0[:, q].unsqueeze(1)   # (N,1)
-        for r in range(Q):
-            eta_r = eta0[:, r].unsqueeze(0)  # (1,N)
-            eta_outer = eta_q @ eta_r        # (N,N)
-
-            num = (A_t * eta_outer * upper_mask).sum()
-            den = (eta_outer * upper_mask).sum()
-
-            Pi0_num[q, r] = num
-            Pi0_den[q, r] = den + epsi
-
-    Pi0 = Pi0_num / Pi0_den
-    Pi0 = 0.5 * (Pi0 + Pi0.T)
-
-    # clamp pour stabilité
-    Pi0 = Pi0.clamp(0.05, 0.95)
-
-    # ===========================
-    # 5) Pi_tilde0 = inverse arctan stable
-    # ===========================
-    Pi_tilde0 = torch.tan(np.pi * (Pi0 - 0.5))
-    Pi_tilde0 = torch.clamp(Pi_tilde0, -10.0, 10.0)
-
-    # IMPORTANT : Pi_tilde0 doit être un vrai nn.Parameter
-    Pi_tilde0 = nn.Parameter(Pi_tilde0)
-
-    # ===========================
-    # STOCKAGE DANS params
-    # ===========================
-    params["eta0"]       = eta0
-    params["z0"]         = z0
-    params["Pi0"]        = Pi0
-    params["Pi_tilde0"]  = Pi_tilde0   # directement utilisable dans training
-
-    return eta0, z0, Pi0, Pi_tilde0
 
 def init_all_params(A, Q, params, eps=1e-6, tau=1e-16):
-    # tester : prior dirichlet sur eta
     """
     Initialise TOUT pour Deep LPBM (VERSION DOUCE, type ancien code):
 
@@ -261,7 +196,7 @@ def unconstrained_Pi_to_Pi(Pi_tilde):
     Pi = 0.5 + torch.atan(Pi_tilde) / np.pi
     return 0.5 * (Pi + Pi.T) # symmétrie
 
-def init_encoder_phase(A, Q, params, results_dir=None):
+def init_encoder_phase(A, Q, params, config, results_dir=None):
     """
     Phase d'initialisation de l’encodeur GCN (Algorithme 1 / App. B.2).
     - µ ≈ z₀ (issu de KMeans)
@@ -272,9 +207,9 @@ def init_encoder_phase(A, Q, params, results_dir=None):
         - courbe de perte d'initialisation init_loss.png
     """
     device   = torch.device(params.get("device", "cpu"))
-    hidden   = (params.get("hidden", HIDDEN_LAYERS_GCN))
-    init_lr  = float(params.get("init_lr", LEARNING_RATE))
-    seed     = int(params.get("seed", RANDOM_STATE))
+    hidden   = (params.get("hidden", config['HIDDEN_LAYERS_GCN']))
+    init_lr  = float(params.get("init_lr", config['LEARNING_RATE']))
+    seed     = int(params.get("seed", config['RANDOM_STATE']))
     tau      = float(params.get("init_tau", 1e-3))
 
     torch.manual_seed(seed)
@@ -286,7 +221,7 @@ def init_encoder_phase(A, Q, params, results_dir=None):
 
     # --- Modèle GCN (créé une fois et stocké dans params)
     #gcn = GCN(in_feats=N, hidden=hidden, out_mu=Q-1, out_lv=1).to(device)
-    gcn = GCNMultiLayers(in_feats=N, hidden=hidden, out_mu=Q-1, out_lv=1, split_last_layer=SPLITLAYER).to(device)
+    gcn = GCNMultiLayers(in_feats=N, hidden=hidden, out_mu=Q-1, out_lv=1, split_last_layer=config['SPLITLAYER']).to(device)
     
 
     # --- Optimiseur pour la phase d'init
@@ -304,7 +239,7 @@ def init_encoder_phase(A, Q, params, results_dir=None):
     # --- Boucle d’entraînement (phase d’init) ---
     loss_history = []
     gcn.train()
-    for _ in range(MAX_EPOCHS_INIT):
+    for _ in range(config['MAX_EPOCHS_INIT']):
         opt.zero_grad()
         mu, logvar = gcn(A_t, X)
         loss_mu = F.mse_loss(mu, z0)
@@ -330,7 +265,7 @@ def init_encoder_phase(A, Q, params, results_dir=None):
     return last_loss
 
 
-def init_encoder_phase_GCNEncoder(A, Q, params, results_dir=None):
+def init_encoder_phase_GCNEncoder(A, Q, params, config, results_dir=None):
     """
     Phase d'initialisation de l’encodeur GCN (version PyTorch Geometric).
 
@@ -344,9 +279,9 @@ def init_encoder_phase_GCNEncoder(A, Q, params, results_dir=None):
         - courbe de perte d'initialisation init_loss.png
     """
     device   = torch.device(params.get("device", "cpu"))
-    hidden   = int(params.get("hidden", HIDDEN_LAYERS_GCN[0]))
-    init_lr  = float(params.get("init_lr", LEARNING_RATE))
-    seed     = int(params.get("seed", RANDOM_STATE))
+    hidden   = int(params.get("hidden", config['HIDDEN_LAYERS_GCN'][0]))
+    init_lr  = float(params.get("init_lr", config['LEARNING_RATE']))
+    seed     = int(params.get("seed", config['RANDOM_STATE']))
     tau      = float(params.get("init_tau", 1e-3))
 
     torch.manual_seed(seed)
@@ -381,7 +316,7 @@ def init_encoder_phase_GCNEncoder(A, Q, params, results_dir=None):
     # --- Boucle d’entraînement (phase d’init) ---
     loss_history = []
     gcn.train()
-    for _ in range(MAX_EPOCHS_INIT):
+    for _ in range(config['MAX_EPOCHS_INIT']):
         opt.zero_grad()
 
         # passage GCNConv → µ, logσ²
@@ -550,7 +485,7 @@ def save_all_figures(results_dir, best, Q):
     plot_eta_histogram(best["eta"], Q, results_dir)
 
 
-def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, node_radius=None, results_dir=None):
+def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, node_radius=None, results_dir=None, show=False, title=None, add_title = ""):
     """
     A : (n,n) 
     eta : (n,k) 
@@ -560,7 +495,7 @@ def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, 
     n, k = eta.shape
 
     if not node_radius:
-        node_radius = 1.5/n
+        node_radius = 4/n
 
 
     if not class_colors:
@@ -578,7 +513,7 @@ def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, 
     pos = nx.spring_layout(G, seed=0)
 
     fig, ax = plt.subplots(figsize=(8,8))
-    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.4)
+    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.4, edge_color='grey')
     
     for i, (x, y) in pos.items():
         start_angle = 90
@@ -624,15 +559,18 @@ def draw_graph_with_probabilities(A, eta, class_colors=None, class_labels=None, 
     ax.relim()        
     ax.autoscale()     
 
+    if title is not None:
+        plt.title(title)
+
     if results_dir is not None:
-        plt.savefig(os.path.join(results_dir, "soft_classification.png"), bbox_inches='tight', dpi=300)
+        plt.savefig(os.path.join(results_dir, add_title + "soft_classification.png"), bbox_inches='tight', dpi=300)
     
-    plt.show()
+    if show: plt.show()
     plt.close()
 
 
 
-def draw_graph_hard_clusters(A, y, class_colors=None, class_labels=None, node_size=None, results_dir=None):
+def draw_graph_hard_clusters(A, y, class_colors=None, class_labels=None, node_size=None, results_dir=None, show=False, title=None, add_title=""):
     """
     A : (n,n) 
     y : (n,k) 
@@ -663,7 +601,7 @@ def draw_graph_hard_clusters(A, y, class_colors=None, class_labels=None, node_si
     pos = nx.spring_layout(G, seed=0)
 
     fig, ax = plt.subplots(figsize=(8,8))
-    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.4)
+    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.4, edge_color='grey')
     nx.draw_networkx_nodes(G, pos,
                            node_color=node_colors,
                            node_size=node_size,
@@ -676,20 +614,20 @@ def draw_graph_hard_clusters(A, y, class_colors=None, class_labels=None, node_si
         circ = plt.Circle((x, y), node_size/30000, fill=False, edgecolor='black', lw=0.5)
         ax.add_patch(circ)
 
-
-
-    legend_patches = [Patch(facecolor=c, edgecolor='black', label=label) for c, label in zip(class_colors, class_labels)]
-    ax.legend(handles=legend_patches, loc='upper right', bbox_to_anchor=(1.15, 1))
-
+    #legend_patches = [Patch(facecolor=c, edgecolor='black', label=label) for c, label in zip(class_colors, class_labels)]
+    #ax.legend(handles=legend_patches, loc='upper right', bbox_to_anchor=(1.15, 1))
     
     ax.set_aspect('equal')
     ax.axis('off')
 
+    if title is not None:
+        plt.title(title)
+
 
     if results_dir is not None:
-        plt.savefig(os.path.join(results_dir, "hard_clusters.png"), bbox_inches='tight', dpi=300)
+        plt.savefig(os.path.join(results_dir, add_title + "hard_clusters.png"), bbox_inches='tight', dpi=300)
     
-    plt.show()
+    if show: plt.show()
     plt.close()
 
 
@@ -719,25 +657,28 @@ def elbo_stub(A, P, mu, logvar):
 # ENTRAÎNEMENT (Algorithme 1)
 # ---------------------------------------------------------------------
 
-def train_deep_lpbm_GCN(A, Q, seed=RANDOM_STATE, results_dir=None):
+def train_deep_lpbm_GCN(A, Q, config, seed=None, results_dir=None):
+    if seed is None: 
+        seed = config['RANDOM_STATE']
+    
     device = torch.device("cpu")
     A_t = torch.tensor(A, dtype=torch.float32, device=device)
 
     best = {"elbo": -np.inf, "eta": None, "Pi": None}
-    for s in range(NUM_SEEDS):
+    for s in range(config['NUM_SEEDS']):
         params = {"Q": Q, "seed": seed + s, "device": device,
-                  "hidden": HIDDEN_LAYERS_GCN, "init_lr": LEARNING_RATE}
+                  "hidden": config['HIDDEN_LAYERS_GCN'], "init_lr": config['LEARNING_RATE']}
         
-        init_encoder_phase(A, Q, params, results_dir)
+        init_encoder_phase(A, Q, params, config, results_dir)
 
         gcn = params["gcn"]
         Pi_tilde = params["Pi_tilde0"]
         #Pi_tilde = torch.zeros((Q, Q), dtype=torch.float32, device=device, requires_grad=True)
-        opt = torch.optim.Adam(list(gcn.parameters()) + [Pi_tilde], lr=LEARNING_RATE)
+        opt = torch.optim.Adam(list(gcn.parameters()) + [Pi_tilde], lr=config['LEARNING_RATE'])
 
         elbo_history = []
         gcn.train()
-        for _ in range(MAX_EPOCHS):
+        for _ in range(config['MAX_EPOCHS'] ):
             opt.zero_grad()
             X = torch.eye(A_t.size(0), dtype=torch.float32, device=device)
             mu, logvar = gcn(A_t, X)
@@ -772,11 +713,14 @@ def train_deep_lpbm_GCN(A, Q, seed=RANDOM_STATE, results_dir=None):
 
 
 
-def train_deep_lpbm_GCNEncoder(A, Q, seed=RANDOM_STATE, results_dir=None):
+def train_deep_lpbm_GCNEncoder(A, Q, config, seed=None, results_dir=None):
     """
     Entraîne un modèle Deep LPBM avec encodeur GCN probabiliste (version PyG).
     - Utilise la nouvelle classe GCN basée sur GCNConv (entrée sparse edge_index).
     """
+
+    if seed is None:
+        seed = config['RANDOM_STATE']
     device = torch.device("cpu")
     torch.manual_seed(seed)
 
@@ -790,26 +734,26 @@ def train_deep_lpbm_GCNEncoder(A, Q, seed=RANDOM_STATE, results_dir=None):
 
     best = {"elbo": -np.inf, "eta": None, "Pi": None}
 
-    for s in range(NUM_SEEDS):
+    for s in range(config['NUM_SEEDS']):
         torch.manual_seed(seed + s)
 
         # Initialisation du modèle GCN (défini ailleurs avec GCNConv)
         params = {"Q": Q, "seed": seed + s, "device": device,
-                  "hidden": HIDDEN_LAYERS_GCN[0] #attend un entier
-                  , "init_lr": LEARNING_RATE}
-        init_encoder_phase_GCNEncoder(A, Q, params, results_dir)
+                  "hidden": config['HIDDEN_LAYERS_GCN'][0] #attend un entier
+                  , "init_lr": config['LEARNING_RATE']}
+        init_encoder_phase_GCNEncoder(A, Q, params, config, results_dir)
         gcn = params["gcn"]  # ta classe GCN (avec GCNConv)
 
         # Paramètres du LPBM
         Pi_tilde = params["Pi_tilde0"]
         #Pi_tilde = torch.zeros((Q, Q), dtype=torch.float32, device=device, requires_grad=True)
-        opt = torch.optim.Adam(list(gcn.parameters()) + [Pi_tilde], lr=LEARNING_RATE)
+        opt = torch.optim.Adam(list(gcn.parameters()) + [Pi_tilde], lr=config['LEARNING_RATE'])
 
         elbo_history = []
 
         # === Phase d'entraînement ===
         gcn.train()
-        for _ in range(MAX_EPOCHS):
+        for _ in range(config['MAX_EPOCHS'] ):
             opt.zero_grad()
 
             # Passage GCN → µ et logσ²
@@ -933,11 +877,17 @@ def collapse_small_clusters(eta, min_size_ratio=0.03):
     return eta_new
 
 
-def model_selection_over_Q(A, Q_list, subject_name="subject", seed=RANDOM_STATE, CLASS_GCN = CLASS_GCN):
+def model_selection_over_Q(A, Q_list, config, subject_name="subject", seed=None, CLASS_GCN = None):
     """
     Essaie plusieurs valeurs de Q et renvoie le meilleur modèle selon l'AIC.
     Crée un sous-dossier results/<subject_name>/Q_<Q>/ pour chaque entraînement.
     """
+    if seed is None:
+        seed = config['RANDOM_STATE']
+
+    if CLASS_GCN is None:
+        CLASS_GCN = config['CLASS_GCN'] 
+
     results_dir_base = os.path.join("results", subject_name)
     os.makedirs(results_dir_base, exist_ok=True)
 
@@ -946,10 +896,10 @@ def model_selection_over_Q(A, Q_list, subject_name="subject", seed=RANDOM_STATE,
     for Q in Q_list:
         print(f"\n=== Entraînement pour Q = {Q} ===")
         results_dir_Q = os.path.join(results_dir_base, f"Q_{Q}")
-        if CLASS_GCN == "GCN":
-            fit = train_deep_lpbm_GCN(A, Q, seed=seed, results_dir=results_dir_Q)
-        if CLASS_GCN == "GCNEncoder":
-            fit = train_deep_lpbm_GCNEncoder(A, Q, seed=seed, results_dir=results_dir_Q)
+        if config['CLASS_GCN']  == "GCN":
+            fit = train_deep_lpbm_GCN(A, Q, config, seed=seed, results_dir=results_dir_Q)
+        if config['CLASS_GCN']  == "GCNEncoder":
+            fit = train_deep_lpbm_GCNEncoder(A, Q, config, seed=seed, results_dir=results_dir_Q)
         
         # collapse éventuel des petits clusters
         eta_collapsed = collapse_small_clusters(fit["eta"], min_size_ratio=0.03)
@@ -972,7 +922,7 @@ def model_selection_over_Q(A, Q_list, subject_name="subject", seed=RANDOM_STATE,
             f.write(f"AIC: {AIC:.3f}\nBIC: {BIC:.3f}\nICL: {ICL:.3f}\nELBO: {fit['elbo']:.3f}\n")
 
     # Sélection du meilleur modèle selon AIC (comme recommandé dans l’article)
-    best = max(results, key=lambda d: d[METRIC])
+    best = max(results, key=lambda d: d[config['METRIC']])
     best_Q = best["Q"]
 
     plt.figure(figsize=(6, 4))
@@ -1017,7 +967,7 @@ def H_partial_memberships_score(eta_true, eta_hat):
     N = eta_true.shape[0]
     tri = np.triu_indices(N, k=0)  # i<j, exclut la diagonale
     diff = np.abs(U_true - U_hat)[tri]
-    return np.sqrt(2.0/(N*(N-1))) * diff.sum()
+    return np.sqrt(2.0/(N*(N-1)) * diff.sum()   )
 
 
 
@@ -1194,20 +1144,41 @@ def save_Pi_comparison(Pi_true, Pi_pred, outpath):
     plt.close()
 
 
-def main():
+def main( config={} ):
+
+    config_zero = {
+        'MODE' : "assortative", 
+        'DATA_DIR' : "data_synthetic/assortative" ,
+        'RANDOM_STATE' : 42,
+        'HIDDEN_LAYERS_GCN' : [ 32 ], 
+        'SPLITLAYER' : False,
+        'MAX_EPOCHS_INIT' : 300,     # Phase init encodeur (Algorithme 1)
+        'MAX_EPOCHS' : 600,          # Phase estimation (Algorithme 1)
+        'LEARNING_RATE' : 1e-2 ,   # Adam lr=0.01 dans l'article
+        'NUM_SEEDS' : 5,           # on garde le meilleur ELBO
+        'CLASS_GCN' : "GCNEncoder",  #  "GCNEncoder" , 
+        'SUBJECT_IDX' : 0,
+        'METRIC' : "AIC",
+        'Q_list' : [3, 4, 5, 6, 7]       }# AIC, BIC, ICL 
+
+    for key in config_zero.keys():
+        if key not in config:
+            config[key] = config_zero[key]
+
+
     # --- 2. Sélection du sujet ---
     
-    A_filename = f"A_{SUBJECT_IDX:03d}.npy"     
-    A_path = os.path.join(DATA_DIR, A_filename) 
+    A_filename = f"A_{config['SUBJECT_IDX']:03d}.npy"     
+    A_path = os.path.join(config['DATA_DIR'], A_filename) 
 
     A = np.load(A_path)
     
     subject_name = os.path.splitext(os.path.basename(A_path))[0].replace("A_", "")
-    print(f"Sujet sélectionné : {subject_name} dans le dossier {DATA_DIR}")
+    print(f"Sujet sélectionné : {subject_name} dans le dossier {config['DATA_DIR']}")
 
     # --- 3. Sélection du nombre de clusters ---
-    Q_list = [6,5,4,3]
-    best, all_results = model_selection_over_Q(A, Q_list, subject_name=MODE + subject_name)
+    Q_list = config['Q_list']
+    best, all_results = model_selection_over_Q(A, Q_list, config, subject_name=config['MODE'] + subject_name)
 
     # --- 4. Résumé du meilleur modèle ---
     print("\n=== Meilleur modèle ===")
@@ -1221,9 +1192,9 @@ def main():
     Pi = best['Pi']
 
     # --- 6. Recherche d’un fichier y_* pour vérifier s’il s’agit de données synthétiques ---
-    y_path = os.path.join(DATA_DIR, os.path.basename(A_path).replace("A_", "y_"))
-    Pi_path = os.path.join(DATA_DIR, os.path.basename(A_path).replace("A_", "Pi_"))
-    eta_path = os.path.join(DATA_DIR, os.path.basename(A_path).replace("A_", "eta_"))
+    y_path = os.path.join(config['DATA_DIR'], os.path.basename(A_path).replace("A_", "y_"))
+    Pi_path = os.path.join(config['DATA_DIR'], os.path.basename(A_path).replace("A_", "Pi_"))
+    eta_path = os.path.join(config['DATA_DIR'], os.path.basename(A_path).replace("A_", "eta_"))
     
     if os.path.exists(y_path):
         print("\n=== Données synthétiques détectées ===")
@@ -1250,13 +1221,13 @@ def main():
             y_true=y,
             y_pred=y_hat,
             mapping=best_label_permutation(y, y_hat),
-            subject_name=MODE + subject_name,
+            subject_name=config['MODE'] + subject_name,
             results_root="results"
         )
 
         # --- 10. Sauvegarde de Π vraie et prédite ---
     
-        results_dir = os.path.join("results", MODE + subject_name)
+        results_dir = os.path.join("results", config['MODE'] + subject_name)
         os.makedirs(results_dir, exist_ok=True)
 
         fig_path = os.path.join(results_dir, "Pi_comparison.png")
@@ -1266,7 +1237,8 @@ def main():
         print("\n=== Données réelles ===")
         print("Aucune vérité terrain disponible.")
         print("Comptages par cluster prédits :", cluster_counts(y_hat))
-
+    
+    return {"z": y_hat, "K": best['Q'], "eta": best['eta']}
 
 if __name__ == "__main__":
     main()

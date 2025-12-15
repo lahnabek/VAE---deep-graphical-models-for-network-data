@@ -1,0 +1,9 @@
+{
+  "mode": "disassortative",
+  "N": 60,
+  "Q": 5,
+  "beta": 0.9,
+  "eps": 0.05,
+  "zeta": 1.0,
+  "n_graphs": 1
+}
