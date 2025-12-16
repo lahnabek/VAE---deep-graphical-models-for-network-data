@@ -31,23 +31,23 @@ def compute_H(eta_true, eta_pred):
 def run_deeplpbm_hyper_experiment(
     mode="assortative",
     outdir="synthetic_runs",
-    N=250,
+    N_list=[12002200, 4400],
     Q=5,
     beta=0.8,
     eps=0.1,
-    zetas=np.linspace(1.0, 1.0, 1),
+    zetas=np.linspace(0.7, 0.7, 1),
     n_graphs=15,
     hidden_list=[[32]],
     lr_list=[0.005],
     neg_ratio_list=[3],
-    Q_list=[4,5,6]
+    Q_list=[5]
 ):
 
     os.makedirs("deeplpbm_hyper_results", exist_ok=True)
 
     # Fichier CSV détaillé (une ligne par exécution)
-    detailed_csv = "deeplpbm_hyper_results/deeplpbm_runs_detailed3.csv"
-    summary_csv  = "deeplpbm_hyper_results/deeplpbm_hyper_summary3.csv"
+    detailed_csv = "deeplpbm_hyper_results/deeplpbm_runs_detailed5.csv"
+    summary_csv  = "deeplpbm_hyper_results/deeplpbm_hyper_summary5.csv"
 
     detailed_rows = []   # pour enregistrement complet
     summary_rows  = []   # pour agrégations
@@ -68,82 +68,83 @@ def run_deeplpbm_hyper_experiment(
                 # Boucle difficulté (zeta)
                 for z in zetas:
                     print(f"  - zeta = {z}")
-
-                    # Plusieurs graphes pour ce z
-                    for seed in range(n_graphs):
-
-                        # -----------------------------
-                        # Génération du graphe
-                        # -----------------------------
-                        generate_synthetic(
-                            mode=mode,
-                            outdir=outdir,
-                            n_graphs=1,
-                            N=N,
-                            Q=Q,
-                            beta=beta,
-                            eps=eps,
-                            zeta=z,
-                            seed=seed
-                        )
-                        for Q_tested in Q_list:
-                            # Charger les données
-                            A = np.load(f"{outdir}/{mode}/A_000.npy")
-                            y_true = np.load(f"{outdir}/{mode}/y_000.npy")
-                            eta_true = np.load(f"{outdir}/{mode}/eta_000.npy")
+                    for N in N_list:
+                        # Plusieurs graphes pour ce z
+                        for seed in range(n_graphs):
 
                             # -----------------------------
-                            # Appel Deep LPBM (avec timer)
+                            # Génération du graphe
                             # -----------------------------
-                            t0 = time.time()
-                            fit = train_deep_lpbm_GCNEncoder(
-                                A=A,
-                                Q=Q_tested,
-                                seed=seed,
-                                results_dir=None,
-                                negetive_sampling=False,
-                                neg_ratio=neg,
-                                hidden_override=hidden,
-                                lr_override=lr
+                            generate_synthetic(
+                                mode=mode,
+                                outdir=outdir,
+                                n_graphs=1,
+                                N=N,
+                                Q=Q,
+                                beta=beta,
+                                eps=eps,
+                                zeta=z,
+                                seed=seed
                             )
-                            t1 = time.time()
-                            elapsed = t1 - t0
+                            for Q_tested in Q_list:
+                                # Charger les données
+                                A = np.load(f"{outdir}/{mode}/A_000.npy")
+                                y_true = np.load(f"{outdir}/{mode}/y_000.npy")
+                                eta_true = np.load(f"{outdir}/{mode}/eta_000.npy")
 
-                            eta_pred = fit["eta"]
-                            y_pred = eta_pred.argmax(axis=1)
+                                # -----------------------------
+                                # Appel Deep LPBM (avec timer)
+                                # -----------------------------
+                                t0 = time.time()
+                                fit = train_deep_lpbm_GCNEncoder(
+                                    A=A,
+                                    Q=Q_tested,
+                                    seed=seed,
+                                    results_dir=None,
+                                    negetive_sampling=False,
+                                    neg_ratio=neg,
+                                    hidden_override=hidden,
+                                    lr_override=lr
+                                )
+                                t1 = time.time()
+                                elapsed = t1 - t0
 
-                            # -----------------------------
-                            # Évaluation
-                            # -----------------------------
-                            AIC, BIC, ICL = compute_AIC_BIC_ICL(A, eta_pred, fit["Pi"])
-                            ari = adjusted_rand_score(y_true, y_pred)
-                            nmi = normalized_mutual_info_score(y_true, y_pred)
-                            H = compute_H(eta_true, eta_pred)
+                                eta_pred = fit["eta"]
+                                y_pred = eta_pred.argmax(axis=1)
 
-                            ARIs.append(ari)
-                            NMIs.append(nmi)
-                            Hs.append(H)
-                            Times.append(elapsed)
+                                # -----------------------------
+                                # Évaluation
+                                # -----------------------------
+                                AIC, BIC, ICL = compute_AIC_BIC_ICL(A, eta_pred, fit["Pi"])
+                                ari = adjusted_rand_score(y_true, y_pred)
+                                nmi = normalized_mutual_info_score(y_true, y_pred)
+                                H = compute_H(eta_true, eta_pred)
 
-                            # -----------------------------
-                            # Sauvegarde détaillée
-                            # -----------------------------
-                            detailed_rows.append({
-                                "hidden": str(hidden),
-                                "lr": lr,
-                                "neg_ratio": neg,
-                                "zeta": z,
-                                "seed": seed,
-                                "ARI": ari,
-                                "NMI": nmi,
-                                "H": H,
-                                "time_sec": elapsed,
-                                "elbo": fit["elbo"],
-                                "AIC": AIC,
-                                "BIC": BIC,
-                                "ICL": ICL,
-                                "Q_tested": Q_tested
-                            })
+                                ARIs.append(ari)
+                                NMIs.append(nmi)
+                                Hs.append(H)
+                                Times.append(elapsed)
+
+                                # -----------------------------
+                                # Sauvegarde détaillée
+                                # -----------------------------
+                                detailed_rows.append({
+                                    "hidden": str(hidden),
+                                    "lr": lr,
+                                    "neg_ratio": neg,
+                                    "zeta": z,
+                                    "seed": seed,
+                                    "ARI": ari,
+                                    "NMI": nmi,
+                                    "H": H,
+                                    "time_sec": elapsed,
+                                    "elbo": fit["elbo"],
+                                    "AIC": AIC,
+                                    "BIC": BIC,
+                                    "ICL": ICL,
+                                    "Q_tested": Q_tested,
+                                    "N": N
+                                })
 
                 # -----------------------------
                 # Résumé pour cette config
@@ -461,11 +462,72 @@ def mainARi():
     plt.grid(axis="y")
     plt.show()
 
+def plotHvN():
+
+    # -----------------------------
+    # 1. Load data
+    # -----------------------------
+    df = pd.read_csv("deeplpbm_hyper_results/deeplpbm_runs_detailed4.csv")
+
+
+    # -----------------------------
+    # 2. Group by hidden dimension
+    # -----------------------------
+    summary = df.groupby("N").agg({
+        "H": ["mean", "std"],
+        "time_sec": ["mean", "std"]
+    })
+
+    # flatten MultiIndex columns
+    summary.columns = ["H_mean", "H_std", "time_mean", "time_std"]
+    summary = summary.reset_index()
+
+    print(summary)
+
+    # -----------------------------
+    # 3. H-score plot with error bars
+    # -----------------------------
+    plt.figure(figsize=(7, 5))
+    plt.bar(
+        summary["N"].astype(str),
+        summary["H_mean"],
+        yerr=summary["H_std"],
+        capsize=8,
+        color="skyblue",
+        edgecolor="black"
+    )
+    plt.xlabel("N")
+    plt.ylabel("H score (lower is better)")
+    plt.title("H vs N")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # -----------------------------
+    # 4. Runtime plot with error bars
+    # -----------------------------
+    plt.figure(figsize=(7, 5))
+    plt.bar(
+        summary["N"].astype(str),
+        summary["time_mean"],
+        yerr=summary["time_std"],
+        capsize=8,
+        color="salmon",
+        edgecolor="black"
+    )
+    plt.xlabel("N")
+    plt.ylabel("Mean runtime (seconds)")
+    plt.title("Runtime vs N")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
 
 # ---------------------------------------------------------------
 #  EXÉCUTION DIRECTE
 # ---------------------------------------------------------------
 if __name__ == "__main__":
     #run_deeplpbm_hyper_experiment()
-    #plotAIC()
-    mainARi()
+    plotHvN()
+    #mainARi()
+    #plotTime()

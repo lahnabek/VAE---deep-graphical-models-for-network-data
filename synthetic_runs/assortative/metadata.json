@@ -1,9 +1,9 @@
 {
   "mode": "assortative",
-  "N": 250,
+  "N": 1200,
   "Q": 5,
   "beta": 0.8,
   "eps": 0.1,
-  "zeta": 1.0,
+  "zeta": 0.7,
   "n_graphs": 1
 }
