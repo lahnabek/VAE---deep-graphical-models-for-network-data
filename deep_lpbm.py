@@ -65,7 +65,9 @@ config_zero = {
     'CLASS_GCN' : CLASS_GCN,  #  "GCNEncoder" , 
     'SUBJECT_IDX' : SUBJECT_IDX,
     'METRIC' : "AIC",
-    'Q_list' : Q_list      }# AIC, BIC, ICL 
+    'Q_list' : Q_list,
+    'NEG_RATIO': NEG_RATIO,
+    'USE_NEGATIVE_SAMPLING' : USE_NEGATIVE_SAMPLING  }
 
 import matplotlib
 """
@@ -734,6 +736,7 @@ def train_deep_lpbm_GCN(A, Q, config, seed=None, results_dir=None, negetive_samp
         # 1) arêtes positives
         edges_pos = torch.nonzero(A_t.triu(diagonal=1), as_tuple=False)   # (E_pos, 2)
 
+        N = A_t.size(0)
         # 2) toutes les non-arêtes possibles
         iu, ju = torch.triu_indices(N, N, offset=1, device=device)
         mask = (A_t[iu, ju] == 0)
@@ -1276,7 +1279,10 @@ def main( config={} ):
         'CLASS_GCN' : "GCNEncoder",  #  "GCNEncoder" , 
         'SUBJECT_IDX' : 0,
         'METRIC' : "AIC",
-        'Q_list' : [3, 4, 5, 6, 7]       }# AIC, BIC, ICL 
+        'Q_list' : [3, 4, 5, 6, 7]       ,
+        'NEG_RATIO': 5,
+        'USE_NEGATIVE_SAMPLING' : False  }
+
 
     for key in config_zero.keys():
         if key not in config:
@@ -1295,7 +1301,7 @@ def main( config={} ):
 
     # --- 3. Sélection du nombre de clusters ---
     Q_list = config['Q_list']
-    best, all_results = model_selection_over_Q(A, Q_list, config, subject_name=config['MODE'] + subject_name, negetive_sampling=USE_NEGATIVE_SAMPLING, neg_ratio=NEG_RATIO)
+    best, all_results = model_selection_over_Q(A, Q_list, config, subject_name=config['MODE'] + subject_name, negative_sampling=config['USE_NEGATIVE_SAMPLING'], neg_ratio=config['NEG_RATIO'])
 
     # --- 4. Résumé du meilleur modèle ---
     print("\n=== Meilleur modèle ===")

@@ -7,7 +7,7 @@ Implementation of DeepLPBM algorithm fro graph clustering, based on:
 
 ## Project Overview
 
-This project was realized in the context of the Introduction to Probabilsitic graphcial Models adn Deep Generative Models course taught by Pierre Latouche and Pierre-Alexandre Mattei in the MVA master's program. 
+This project was realized in the context of the Introduction to Probabilsitic graphcial Models and Deep Generative Models course taught by Pierre Latouche and Pierre-Alexandre Mattei in the MVA master's program. 
 
 For a quick exposition of the main algorithm DeepLPBM, we invite the reader to go through **exposition.ipynb**. For a more thorough examination, below we detail the workings of all files in the project.
 
@@ -32,9 +32,9 @@ networkx
 
 To run autres_algos.py and evaluation.py:
 
+graph_tool
 igraph
 leidenalg
-graph_tool
 graspologic
  
 
@@ -50,6 +50,8 @@ graspologic
 
 ### Python Files
 
+
+
 - **class_GCNEncoder**: Contains the GCN Encoder architecture for the main algorithm.
 
 - **deep_lpbm.py**: Implementation of the Deep LPBM algorithm. It depends on "class_GCNEncoder.py". Can be run from the command line, using its internal config, or its main function "main" can be imported.
@@ -62,20 +64,25 @@ graspologic
 
 - **data.py**: Used to turn HCP-100 into usable connectivity graphs. 
 
+- **hyperparameters, 1, 2, 3, 4.py**: hyperparameters test on various types of sythetic data.
+
+- **hpbench.py, hpaalysis.py**: analyse des hyperparametres. 
+
 
 ### Notebooks
 
 - **human:brains_exp.ipynb**: Experiment with HCP-100 dataset. 
+
 - **exposition.ipynb**: Expository file, contains the most important functions from "deep_lpbm.py" and some comments. 
+
 
 ### Other directories
 - data_synthetic: Directory where synthetic data is stored. Anytime synthetic_data.py is run, this gets rewritten.
 - dataset_numpy_spanningtree: The processed HCP-100 dataset.
 - human_brains_networks_results: Where we store results on the experiment on the HCP-100 dataset.
-- Comparison: Directory where we store results for xomparison experiments.
+- Comparison: Directory where we store results for comparison experiments.
 - results: general directory where deep_lpbm stores results unless differently propmted.
 
-- debug_data:
 
 
 
