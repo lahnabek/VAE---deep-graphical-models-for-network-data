@@ -24,6 +24,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib.patches import Wedge, Patch
 import matplotlib.colors as mcolors
+import time
 
 
 
@@ -48,6 +49,8 @@ CLASS_GCN = "GCNEncoder"  #  "GCNEncoder" ,
 SUBJECT_IDX = 0
 METRIC = "AIC" # AIC, BIC, ICL
 Q_list = [3, 4, 5, 6, 7]
+NEG_RATIO = 5
+USE_NEGATIVE_SAMPLING = False
 
 config_zero = {
     'MODE' : MODE, # disassortative, assortative, hub
@@ -64,9 +67,7 @@ config_zero = {
     'METRIC' : "AIC",
     'Q_list' : Q_list      }# AIC, BIC, ICL 
 
-
-
-
+import matplotlib
 """
 ancienne config GCN 2 couches de l'article, marche bien sur Q=3 mais pas au dela:
 HIDDEN_LAYERS_GCN = [32]
@@ -378,7 +379,8 @@ def make_debug_dir(results_dir, name="init_debug"):
 
 
 def save_init_debug_figures(A, eta0, z0, Pi0, Pi_tilde0, results_dir):
-
+    if results_dir is None:
+        return
     debug_dir = make_debug_dir(results_dir)
 
     # --- FIGURE 1 : Heatmap de eta0 ---
@@ -643,8 +645,70 @@ def draw_graph_hard_clusters(A, y, class_colors=None, class_labels=None, node_si
 # OBJECTIF (ELBO) 
 # ---------------------------------------------------------------------
 
+#Need Pi and eta if neg sampling
+def elbo_stub(A, P, mu, logvar, Pi=None, eta=None, 
+              use_negative_sampling=False, neg_ratio=5, edges_pos=None, neg_pairs_all=None):
+    """
+    ELBO avec ou sans negative sampling.
+    Si use_negative_sampling=False → version complète O(N^2)
+    Si True → edges + neg_samples
+    """
 
-def elbo_stub(A, P, mu, logvar):
+    eps = 1e-8 #Prevent from having log(0)
+
+    # =========================================================
+    #   CAS 1 : PAS DE NEGATIVE SAMPLING → VERSION COMPLETE
+    # =========================================================
+    if not use_negative_sampling:
+        N = A.shape[0]
+        ij = np.triu_indices(N, 1)
+        ll = (A[ij] * torch.log(P[ij] + eps) 
+             + (1-A[ij]) * torch.log(1-P[ij] + eps)).sum()
+
+    # =========================================================
+    #   CAS 2 : NEGATIVE SAMPLING (utilise Pi et eta)
+    # =========================================================
+    else:
+        # ---------- 1) positive edges ----------
+        assert edges_pos is not None and neg_pairs_all is not None
+        eps = 1e-8
+
+        # ---------- 1) positive edges (déjà pré-calculées) ----------
+        i_pos = edges_pos[:, 0]
+        j_pos = edges_pos[:, 1]
+
+        eta_i = eta[i_pos]          # (E_pos, Q)
+        eta_j = eta[j_pos]          # (E_pos, Q)
+
+        pij_pos = torch.sum(eta_i * (eta_j @ Pi.T), dim=1).clamp(eps, 1 - eps)
+        pos_ll = torch.log(pij_pos).sum()
+
+        # ---------- 2) negative edges (sous-échantillonnées) ----------
+        num_pos = edges_pos.size(0)
+        num_neg = min(neg_ratio * num_pos, neg_pairs_all.size(0))
+
+        idx = torch.randperm(neg_pairs_all.size(0), device=neg_pairs_all.device)[:num_neg]
+        neg_edges = neg_pairs_all[idx]   # (num_neg, 2)
+
+        i_neg = neg_edges[:, 0]
+        j_neg = neg_edges[:, 1]
+
+        eta_i_neg = eta[i_neg]
+        eta_j_neg = eta[j_neg]
+
+        pij_neg = torch.sum(eta_i_neg * (eta_j_neg @ Pi.T), dim=1).clamp(eps, 1 - eps)
+        neg_ll = torch.log(1 - pij_neg).sum()
+
+        ll = pos_ll + neg_ll
+
+
+    # Variance isotrope → logvar shape (N,1)
+    sigma2 = torch.exp(logvar)   # (N,1)
+    kl = 0.5 * (sigma2 + mu**2 - 1 - logvar).sum()
+
+    return ll - kl
+
+def elbo_stub_old(A, P, mu, logvar):
     ij = np.triu_indices(A.shape[0], 1)
     ll = (A[ij] * torch.log(P[ij]) + (1-A[ij]) * torch.log(1-P[ij])).sum()
 
@@ -655,22 +719,32 @@ def elbo_stub(A, P, mu, logvar):
     return ll - kl
 
 
-
 # ---------------------------------------------------------------------
 # ENTRAÎNEMENT (Algorithme 1)
 # ---------------------------------------------------------------------
 
-def train_deep_lpbm_GCN(A, Q, config, seed=None, results_dir=None):
+def train_deep_lpbm_GCN(A, Q, config, seed=None, results_dir=None, negetive_sampling=False, neg_ratio=5, hidden_override=None, lr_override=None):
     if seed is None: 
         seed = config['RANDOM_STATE']
     
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     A_t = torch.tensor(A, dtype=torch.float32, device=device)
-
     best = {"elbo": -np.inf, "eta": None, "Pi": None}
+    if negetive_sampling:
+        # 1) arêtes positives
+        edges_pos = torch.nonzero(A_t.triu(diagonal=1), as_tuple=False)   # (E_pos, 2)
+
+        # 2) toutes les non-arêtes possibles
+        iu, ju = torch.triu_indices(N, N, offset=1, device=device)
+        mask = (A_t[iu, ju] == 0)
+        neg_pairs_all = torch.stack([iu[mask], ju[mask]], dim=1)          # (E_neg, 2)
+    else:
+        edges_pos = None
+        neg_pairs_all = None
+
     for s in range(config['NUM_SEEDS']):
         params = {"Q": Q, "seed": seed + s, "device": device,
-                  "hidden": config['HIDDEN_LAYERS_GCN'], "init_lr": config['LEARNING_RATE']}
+                  "hidden": hidden_override if hidden_override is not None else config['HIDDEN_LAYERS_GCN'], "init_lr": lr_override if lr_override is not None else config['LEARNING_RATE']}
         
         init_encoder_phase(A, Q, params, config, results_dir)
 
@@ -686,9 +760,18 @@ def train_deep_lpbm_GCN(A, Q, config, seed=None, results_dir=None):
             X = torch.eye(A_t.size(0), dtype=torch.float32, device=device)
             mu, logvar = gcn(A_t, X)
             z = reparameterize(mu, logvar)
+            eta = softmax_logits_to_eta(z) if negetive_sampling else None #Nécessaire que pour le negative sampling
             Pi = unconstrained_Pi_to_Pi(Pi_tilde)
-            P = decoder_prob(z, Pi)
-            elbo = elbo_stub(A_t, P, mu, logvar)
+            P = None if negetive_sampling else decoder_prob(z, Pi) #On évite un calcul en O(N*N) avec le negative sampling
+            elbo = elbo_stub(
+                A_t, P, mu, logvar,
+                Pi=Pi,
+                eta=eta,
+                use_negative_sampling=negetive_sampling,
+                neg_ratio=neg_ratio,
+                edges_pos=edges_pos,
+                neg_pairs_all=neg_pairs_all
+            )
 
             loss = -elbo
             loss.backward()
@@ -716,7 +799,7 @@ def train_deep_lpbm_GCN(A, Q, config, seed=None, results_dir=None):
 
 
 
-def train_deep_lpbm_GCNEncoder(A, Q, config, seed=None, results_dir=None):
+def train_deep_lpbm_GCNEncoder(A, Q, config, seed=None, results_dir=None, negetive_sampling=False, neg_ratio=5, hidden_override=None, lr_override=None):
     """
     Entraîne un modèle Deep LPBM avec encodeur GCN probabiliste (version PyG).
     - Utilise la nouvelle classe GCN basée sur GCNConv (entrée sparse edge_index).
@@ -724,26 +807,38 @@ def train_deep_lpbm_GCNEncoder(A, Q, config, seed=None, results_dir=None):
 
     if seed is None:
         seed = config['RANDOM_STATE']
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed)
-
+    
     # Convertit la matrice dense A en format edge_index pour PyG
     A_t = torch.tensor(A, dtype=torch.float32, device=device)
-    edge_index, _ = dense_to_sparse(A_t)     # (2, E)
     N = A_t.size(0)
+    edge_index, _ = dense_to_sparse(A_t)     # (2, E)
+    if negetive_sampling:
+        # 1) arêtes positives
+        edges_pos = torch.nonzero(A_t.triu(diagonal=1), as_tuple=False)   # (E_pos, 2)
 
+        # 2) toutes les non-arêtes possibles
+        iu, ju = torch.triu_indices(N, N, offset=1, device=device)
+        mask = (A_t[iu, ju] == 0)
+        neg_pairs_all = torch.stack([iu[mask], ju[mask]], dim=1)          # (E_neg, 2)
+    else:
+        edges_pos = None
+        neg_pairs_all = None
     # Features : vecteur identité ou constantes (selon ton choix)
     X = torch.eye(N, dtype=torch.float32, device=device)
 
     best = {"elbo": -np.inf, "eta": None, "Pi": None}
-
+    elbo_time = 0
+    gcn_time = 0
+    backward_time = 0
+    eval_time = 0
     for s in range(config['NUM_SEEDS']):
         torch.manual_seed(seed + s)
 
         # Initialisation du modèle GCN (défini ailleurs avec GCNConv)
         params = {"Q": Q, "seed": seed + s, "device": device,
-                  "hidden": config['HIDDEN_LAYERS_GCN'][0] #attend un entier
-                  , "init_lr": config['LEARNING_RATE']}
+                  "hidden": hidden_override[0] if hidden_override is not None else config['HIDDEN_LAYERS_GCN'][0], "init_lr": lr_override if lr_override is not None else config['LEARNING_RATE']}
         init_encoder_phase_GCNEncoder(A, Q, params, config, results_dir)
         gcn = params["gcn"]  # ta classe GCN (avec GCNConv)
 
@@ -760,21 +855,36 @@ def train_deep_lpbm_GCNEncoder(A, Q, config, seed=None, results_dir=None):
             opt.zero_grad()
 
             # Passage GCN → µ et logσ²
+            t0 = time.time()
             mu, logvar = gcn(X, edge_index)
-
+            t1 = time.time()
             # Rééchantillonnage et calcul ELBO
             z = reparameterize(mu, logvar)
+            eta = softmax_logits_to_eta(z) if negetive_sampling else None #Nécessaire que pour le negative sampling
             Pi = unconstrained_Pi_to_Pi(Pi_tilde)
-            P = decoder_prob(z, Pi)
-            elbo = elbo_stub(A_t, P, mu, logvar)
-
+            P = None if negetive_sampling else decoder_prob(z, Pi) #On évite un calcul en O(N*N) avec le negative sampling
+            t2 = time.time()
+            elbo = elbo_stub(
+                A_t, P, mu, logvar,
+                Pi=Pi,
+                eta=eta,
+                use_negative_sampling=negetive_sampling,
+                neg_ratio=neg_ratio,
+                edges_pos=edges_pos,
+                neg_pairs_all=neg_pairs_all
+            )
+            t3 = time.time()
             # Backpropagation
             loss = -elbo
             loss.backward()
             opt.step()
-
+            t4 = time.time()
+            gcn_time += t1-t0
+            elbo_time += t3-t2
+            backward_time += t4-t3
             elbo_history.append(float(elbo.detach().cpu()))
 
+        t5 = time.time()
         # === Phase d'évaluation ===
         gcn.eval()
         with torch.no_grad():
@@ -791,11 +901,14 @@ def train_deep_lpbm_GCNEncoder(A, Q, config, seed=None, results_dir=None):
                 "Pi": Pi,
                 "history": elbo_history
             })
+        t6 = time.time()
+        eval_time += t6-t5
 
+    print(f"GCN: {gcn_time:.4f}  ELBO: {elbo_time:.4f}  backward: {backward_time:.4f} eval: {eval_time:.4f}")
     # === Sauvegarde des figures ===
     if results_dir is not None:
         save_all_figures(results_dir, best, Q)
-
+    print(next(params["gcn"].parameters()).device)
     print(f"[Deep LPBM + GCNConv] Q={Q} — ELBO finale : {best['elbo']:.4f}")
     return best
 
@@ -880,7 +993,8 @@ def collapse_small_clusters(eta, min_size_ratio=0.03):
     return eta_new
 
 
-def model_selection_over_Q(A, Q_list, config, subject_name="subject", seed=None, CLASS_GCN = None):
+def model_selection_over_Q(A, Q_list, config, subject_name="subject", seed=None, CLASS_GCN = None, negetive_sampling=False, neg_ratio=5, hidden_override=HIDDEN_LAYERS_GCN,
+    lr_override=LEARNING_RATE):
     """
     Essaie plusieurs valeurs de Q et renvoie le meilleur modèle selon l'AIC.
     Crée un sous-dossier results/<subject_name>/Q_<Q>/ pour chaque entraînement.
@@ -900,9 +1014,9 @@ def model_selection_over_Q(A, Q_list, config, subject_name="subject", seed=None,
         print(f"\n=== Entraînement pour Q = {Q} ===")
         results_dir_Q = os.path.join(results_dir_base, f"Q_{Q}")
         if config['CLASS_GCN']  == "GCN":
-            fit = train_deep_lpbm_GCN(A, Q, config, seed=seed, results_dir=results_dir_Q)
+            fit = train_deep_lpbm_GCN(A, Q, config, seed=seed, results_dir=results_dir_Q, negetive_sampling=negetive_sampling, neg_ratio=neg_ratio, hidden_override=hidden_override, lr_override=lr_override)
         if config['CLASS_GCN']  == "GCNEncoder":
-            fit = train_deep_lpbm_GCNEncoder(A, Q, config, seed=seed, results_dir=results_dir_Q)
+            fit = train_deep_lpbm_GCNEncoder(A, Q, config, seed=seed, results_dir=results_dir_Q, negetive_sampling=negetive_sampling, neg_ratio=neg_ratio, hidden_override=hidden_override, lr_override=lr_override)
         
         # collapse éventuel des petits clusters
         eta_collapsed = collapse_small_clusters(fit["eta"], min_size_ratio=0.03)
@@ -1181,7 +1295,7 @@ def main( config={} ):
 
     # --- 3. Sélection du nombre de clusters ---
     Q_list = config['Q_list']
-    best, all_results = model_selection_over_Q(A, Q_list, config, subject_name=config['MODE'] + subject_name)
+    best, all_results = model_selection_over_Q(A, Q_list, config, subject_name=config['MODE'] + subject_name, negetive_sampling=USE_NEGATIVE_SAMPLING, neg_ratio=NEG_RATIO)
 
     # --- 4. Résumé du meilleur modèle ---
     print("\n=== Meilleur modèle ===")
@@ -1244,4 +1358,7 @@ def main( config={} ):
     return {"z": y_hat, "K": best['Q'], "eta": best['eta']}
 
 if __name__ == "__main__":
+    start = time.time()
     main()
+    end = time.time()
+    print(f"Temps d'exécution : {end - start:.3f} secondes")
