@@ -9,7 +9,7 @@ Implementation of DeepLPBM algorithm fro graph clustering, based on:
 
 This project was realized in the context of the Introduction to Probabilsitic graphcial Models adn Deep Generative Models course taught by Pierre Latouche and Pierre-Alexandre Mattei in the MVA master's program. 
 
-It implements a two experiments challenging the limitations of the afored mention paper. The code is made to be reproducible and well-documented.
+For a quick exposition of the main algorithm DeepLPBM, we invite the reader to go through **exposition.ipynb**. For a more thorough examination, below we detail the workings of all files in the project.
 
 
 ## Installation
